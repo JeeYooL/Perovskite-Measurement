@@ -174,6 +174,11 @@ def extract_features_from_spectra(file, data_type):
         x = x.loc[common_idx].values
         y = y.loc[common_idx].values
 
+        # x 기준으로 오름차순 정렬 (스펙트럼 분석의 기본)
+        sort_idx = np.argsort(x)
+        x = x[sort_idx]
+        y = y[sort_idx]
+
         features = {}
         
         # 1. Max Intensity & Peak Position
@@ -189,24 +194,51 @@ def extract_features_from_spectra(file, data_type):
         if data_type == "PL" and max_x > 0:
             features[f"{data_type}_Bandgap_eV"] = 1240.0 / max_x
 
-        # 2. FWHM (반치폭)
+        # [신규 기능] XRD 데이터일 경우 Williamson-Hall Plot을 통한 Strain 및 Crystallite Size 계산
+        if data_type == "XRD":
+            try:
+                from scipy.signal import find_peaks, peak_widths
+                # 최대 피크 5% 이상, 분해능 고려 10 샘플 이상 떨어진 피크들 추출
+                peaks, _ = find_peaks(y, height=max_y * 0.05, distance=10)
+                
+                if len(peaks) >= 2:
+                    widths, _, _, _ = peak_widths(y, peaks, rel_height=0.5)
+                    # 데이터 간격을 곱해서 실제 2세타(degree) 단위의 FWHM 계산
+                    x_spacing = np.mean(np.diff(x)) if len(x) > 1 else 1.0
+                    fwhm_degrees = widths * np.abs(x_spacing)
+                    
+                    # W-H Plot (β*cos(θ) = K*λ/D + 4*ε*sin(θ))
+                    # 람다 = 0.15406 nm (Cu K알파)
+                    theta_rad = np.radians(x[peaks] / 2.0)
+                    beta_rad = np.radians(fwhm_degrees)
+                    
+                    wh_y = beta_rad * np.cos(theta_rad)
+                    wh_x = 4.0 * np.sin(theta_rad)
+                    
+                    # 선형 피팅 (y = mx + c), m=입실론(strain)
+                    slope, intercept = np.polyfit(wh_x, wh_y, 1)
+                    
+                    # 수렴 에러로 인한 음수일 경우 0 처리
+                    features[f"{data_type}_Strain"] = float(slope) if slope > -0.01 else 0.0
+                    
+                    if intercept > 0:
+                        D = (0.9 * 0.15406) / intercept
+                        features[f"{data_type}_Crystallite_Size_nm"] = float(D)
+                    else:
+                        features[f"{data_type}_Crystallite_Size_nm"] = 0.0
+            except Exception:
+                pass
+
+
+        # 2. FWHM (반치폭) 최대 피크 기준 로직 (기존 유지)
         half_max = max_y / 2.0
-        sort_idx = np.argsort(x)
-        x_sorted = x[sort_idx]
-        y_sorted = y[sort_idx]
-        
-        # 피크가 여러 개일 수 있으므로 단순화된 로직 사용 (최대 피크 기준)
-        # 1. 최대값보다 왼쪽/오른쪽 데이터 분리
-        #    (x_sorted에서 max_x의 위치를 찾음)
-        #    Note: searchsorted는 정렬된 배열에서만 작동
         try:
-            # 실제 max_x와 정확히 일치하는 인덱스가 없을 수 있으므로 가장 가까운 값 찾기
-            max_pos_idx = np.argmin(np.abs(x_sorted - max_x))
+            max_pos_idx = np.argmin(np.abs(x - max_x))
             
-            left_x = x_sorted[:max_pos_idx]
-            left_y = y_sorted[:max_pos_idx]
-            right_x = x_sorted[max_pos_idx:]
-            right_y = y_sorted[max_pos_idx:]
+            left_x = x[:max_pos_idx]
+            left_y = y[:max_pos_idx]
+            right_x = x[max_pos_idx:]
+            right_y = y[max_pos_idx:]
 
             fwhm = 0
             if len(left_y) > 0 and len(right_y) > 0:
