@@ -555,7 +555,7 @@ if uploaded_files:
                 res = st.session_state.analysis_results
                 st.markdown("---")
                 
-                t1, t2, t3 = st.tabs(["📊 성능 평가", "🔍 중요도 분석", "💡 최적화 제안"])
+                t1, t2, t3, t4 = st.tabs(["📊 성능 평가", "🔍 중요도 분석", "💡 최적화 제안", "🎯 베이지안 역설계"])
                 
                 with t1:
                     col1, col2 = st.columns(2)
@@ -608,6 +608,53 @@ if uploaded_files:
                         
                         suggestions.append({"순위": top_feats.index(feat)+1, "중요 변수": feat, "최고 효율 조건": val, "세부 조건": " | ".join(ctx) if ctx else "-"})
                     st.table(pd.DataFrame(suggestions))
+                
+                with t4:
+                    st.markdown("### 🎯 가상 조건 역설계 (Bayesian Optimization)")
+                    st.write("학습된 가우시안 프로세스 모델을 바탕으로, 목표 성능을 달성할 최적의 미지의 조합을 탐색합니다.")
+                    
+                    if "Gaussian Process" not in res['model_choice']:
+                        st.warning("역설계를 위해서는 '불확실성(Std)'을 예측할 수 있는 **Gaussian Process** 모델을 선택해야 합니다. 좌측 설정에서 ML 모델을 변경해주세요.")
+                    elif not res['is_tree_model']:
+                        st.info("현재 입력 데이터 범위 내에서 Random Search 기반으로 UCB(Upper Confidence Bound) 값이 높은 상위 후보를 도출합니다.")
+                        
+                        r_col1, r_col2 = st.columns(2)
+                        with r_col1:
+                            n_samples = st.number_input("탐색할 가상 샘플 수", min_value=1000, max_value=100000, value=10000, step=1000)
+                        with r_col2:
+                            kappa = st.slider("탐색 계수 (Kappa)", min_value=0.1, max_value=10.0, value=1.96, step=0.1, help="값이 높을수록 미지의 영역(불확실성이 높은 곳)을 더 강하게 탐색합니다.")
+                        
+                        if st.button("🚀 역설계 탐색 시작 (Generate Candidates)"):
+                            with st.spinner("AI가 최적의 물질 조합을 역추적 중입니다..."):
+                                # 1. 가상 데이터 생성 (각 독립 변수별 최소/최대 범위 내 균등 분포 샘플링)
+                                mins = res['X'].min().values
+                                maxs = res['X'].max().values
+                                
+                                virtual_samples = np.random.uniform(mins, maxs, size=(int(n_samples), len(mins)))
+                                virtual_df = pd.DataFrame(virtual_samples, columns=res['X'].columns)
+                                
+                                # 2. 예측 및 불확실성 계산
+                                pred_y, pred_std = res['model'].custom_predict_std(virtual_df)
+                                
+                                # 3. 획득 함수 (UCB)
+                                ucb_score = pred_y + kappa * pred_std
+                                
+                                virtual_df['예측 타겟 성능 (Predicted)'] = pred_y
+                                virtual_df['불확실성 (Std)'] = pred_std
+                                virtual_df['추천 점수 (UCB)'] = ucb_score
+                                
+                                # UCB 기준 정렬
+                                top_candidates = virtual_df.sort_values(by='추천 점수 (UCB)', ascending=False).head(10)
+                                
+                                st.success(f"🎉 역설계 완료! 총 {int(n_samples)}개의 가상 공간을 탐색하여 도출된 상위 10개의 최적 후보입니다.")
+                                st.dataframe(top_candidates)
+                                
+                                st.markdown('''
+                                **💡 해석 가이드:**
+                                - **예측 타겟 성능**: AI가 예측한 이 조합의 성능입니다. 높을수록 우수합니다.
+                                - **불확실성 (Std)**: 이 조합에 대해 AI가 얼마나 확신이 없는지(표준편차)를 나타냅니다. 기존 데이터가 부족한 미개척 영역일수록 값이 큽니다.
+                                - **추천 점수 (UCB)**: `예측치 + (Kappa * 불확실성)`으로 계산되며, 단순히 예상 성능이 높은 곳뿐만 아니라 **시도해볼 가치가 높은 미지의 영역**을 함께 고려하여 점수가 매겨집니다.
+                                ''')
                 
                 st.markdown('<div class="bottom-spacer"></div>', unsafe_allow_html=True)
 else:

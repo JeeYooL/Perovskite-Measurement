@@ -287,7 +287,9 @@ def detect_abnormal_jv(row):
 
 
 # --- [수정됨] 엑셀 파일 파싱 함수 ---
-def load_data_from_new_xlsx(file_path, jv_data_cache):
+def load_data_from_new_xlsx(file_path, local_cache=None):
+    if local_cache is None:
+        local_cache = {}
     """
     수정된 엑셀 형식(.xlsx)을 읽어 데이터를 추출합니다.
     - 파일명 = 샘플 이름
@@ -395,7 +397,7 @@ def load_data_from_new_xlsx(file_path, jv_data_cache):
                             curve_data["J(A/cm2)"] = curve_data["J(mA/cm2)"] / 1000.0
                             synthetic_filename = f"{sample_name_from_file}_{pixel_str}_{mode_str}_{time_str}"
                             synthetic_full_path = os.path.join(os.path.dirname(file_path), synthetic_filename)
-                            jv_data_cache[synthetic_full_path] = curve_data
+                            local_cache[synthetic_full_path] = curve_data
                     else:
                         # Stability 데이터인 경우 곡선 데이터 캐시 대신 리스트에만 추가
                         synthetic_filename = f"{sample_name_from_file}_{pixel_str}_{mode_str}_{time_str}"
@@ -432,7 +434,7 @@ def load_data_from_new_xlsx(file_path, jv_data_cache):
     except Exception as e:
         print(f"Error reading Excel file {file_path}: {e}")
         
-    return all_data
+    return all_data, local_cache
 
 # --- [신규] Stability 데이터(MPPT, SPO, QSS) 파싱 함수 ---
 def load_stability_data_for_sample(file_path):
@@ -1563,7 +1565,7 @@ def filter_best_pce_per_folder():
                         f"변경 후: {len(current_display_df)} 개")
 
 
-def load_and_process_folder(folder_path=None):
+def load_and_process_folder(folder_path=None, on_complete=None):
     # [수정] operator_name, device_structure 전역 변수 추가
     global original_all_devices_df, current_display_df, current_root_folder, \
            experimental_variables, jv_data_cache, \
@@ -1604,50 +1606,71 @@ def load_and_process_folder(folder_path=None):
     file_list = [f for f in glob.glob(os.path.join(folder_path, '*.xlsx')) if not os.path.basename(f).startswith('~$')]
     
     if not file_list: messagebox.showinfo("Info", "No .xlsx files found in this folder."); return
-    all_data = []
     
-    # --- 로딩 프로그레스 바 추가 ---
+    # --- 로딩 표시 (Threaded) ---
     progress_win = tk.Toplevel(root)
     progress_win.title("Loading Data")
-    progress_win.geometry("400x100")
+    progress_win.geometry("400x120")
     progress_win.transient(root)
     progress_win.grab_set()
-    ttk.Label(progress_win, text="Loading and processing Excel files...").pack(pady=10)
+    lbl_progress = ttk.Label(progress_win, text="Initializing processing...")
+    lbl_progress.pack(pady=10)
     progress_bar = ttk.Progressbar(progress_win, orient='horizontal', length=300, mode='determinate')
     progress_bar.pack(pady=10)
     total_files = len(file_list)
-    # --- ---
+    
+    import concurrent.futures
+    import threading
 
-    for i, file_path in enumerate(sorted(file_list)):
-        try:
-            file_name = os.path.basename(file_path)
-            
-            # XLSX 파일 처리
-            xlsx_data_list = load_data_from_new_xlsx(file_path, jv_data_cache)
-            if xlsx_data_list:
-                all_data.extend(xlsx_data_list)
-        except Exception as e:
-            print(f"Error processing '{file_path}': {e}")
-        finally:
-            # Update progress bar
-            progress_bar['value'] = (i + 1) / total_files * 100
-            progress_win.update_idletasks() # Refresh UI
+    all_data = []
 
-    progress_win.destroy() # Remove progress bar after loading
+    def load_task():
+        nonlocal all_data
+        completed = 0
+        def update_ui():
+            if progress_win.winfo_exists():
+                progress_bar['value'] = (completed / total_files) * 100
+                lbl_progress.config(text=f"Processed {completed} of {total_files} files...")
+        
+        with concurrent.futures.ProcessPoolExecutor() as executor:
+            futures = {executor.submit(load_data_from_new_xlsx, file_path, {}): file_path for file_path in sorted(file_list)}
+            for future in concurrent.futures.as_completed(futures):
+                file_path = futures[future]
+                try:
+                    xlsx_data_list, ext_cache = future.result()
+                    if xlsx_data_list:
+                        all_data.extend(xlsx_data_list)
+                        jv_data_cache.update(ext_cache)
+                except Exception as e:
+                    print(f"Error processing '{file_path}': {e}")
+                finally:
+                    completed += 1
+                    root.after(0, update_ui)
+        
+        root.after(0, finalize_loading)
 
-    if not all_data:
-         messagebox.showerror("Error", "No valid data could be processed from the selected folder.")
-         return
+    def finalize_loading():
+        progress_win.destroy()
+        if not all_data:
+             messagebox.showerror("Error", "No valid data could be processed from the selected folder.")
+             return
+             
+        global original_all_devices_df, current_display_df
+        original_all_devices_df = pd.DataFrame(all_data)
 
-    original_all_devices_df = pd.DataFrame(all_data)
+        cols_to_numeric = ['Voc (V)', 'Jsc (mA/cm2)', 'FF (%)', 'PCE (%)', 'Rs (Ω·cm²)', 'Rsh (Ω·cm²)']
+        for col in cols_to_numeric:
+            if col in original_all_devices_df.columns:
+                original_all_devices_df[col] = pd.to_numeric(original_all_devices_df[col], errors='coerce')
 
-    cols_to_numeric = ['Voc (V)', 'Jsc (mA/cm2)', 'FF (%)', 'PCE (%)', 'Rs (Ω·cm²)', 'Rsh (Ω·cm²)']
-    for col in cols_to_numeric:
-        if col in original_all_devices_df.columns:
-            original_all_devices_df[col] = pd.to_numeric(original_all_devices_df[col], errors='coerce')
+        current_display_df = original_all_devices_df.copy()
+        refresh_all_views(current_display_df) # Refresh views with the newly loaded data
 
-    current_display_df = original_all_devices_df.copy()
-    refresh_all_views(current_display_df) # Refresh views with the newly loaded data
+        if on_complete:
+            on_complete()
+
+    # 백그라운드 스레드에서 파일 로딩 시작
+    threading.Thread(target=load_task, daemon=True).start()
 
 
 def merge_selected_folders():
@@ -2006,106 +2029,105 @@ def load_state():
         # --- [신규 끝] ---
 
 
-        # 1. Load data from the saved root folder first
-        # [수정] 이 함수는 is_fresh_load=False로 실행되어 팝업을 띄우지 않습니다.
-        load_and_process_folder(state['root_folder']) # This resets current_display_df to original
+        def finish_load_state():
+            global experimental_variables, process_details
+            
+            # --- 수정된 부분 (2) ---
+            # load_and_process_folder에 의해 초기화된 전역 변수들을
+            # 아까 임시 저장해둔 로컬 변수 값으로 다시 복원합니다.
+            experimental_variables.clear()
+            experimental_variables.update(loaded_exp_vars)
+            process_details.clear()
+            process_details.update(loaded_proc_details)
+            # --- 수정 끝 ---
 
-        # --- 수정된 부분 (2) ---
-        # load_and_process_folder에 의해 초기화된 전역 변수들을
-        # 아까 임시 저장해둔 로컬 변수 값으로 다시 복원합니다.
-        experimental_variables = loaded_exp_vars
-        process_details = loaded_proc_details
-        # --- 수정 끝 ---
+            # 2. Apply the saved merge state AFTER loading
+            merge_info = state.get('merge_info', {})
+            if merge_info:
+                # Apply merge map to the newly loaded current_display_df
+                current_display_df['Sample'] = current_display_df['FullPath'].map(merge_info).fillna(current_display_df['Sample'])
 
-        # 2. Apply the saved merge state AFTER loading
-        merge_info = state.get('merge_info', {})
-        if merge_info:
-            # Apply merge map to the newly loaded current_display_df
-            current_display_df['Sample'] = current_display_df['FullPath'].map(merge_info).fillna(current_display_df['Sample'])
+            # 3. Apply filters
+            filters = state.get('filters', {})
+            filter_voc_min.set(filters.get("voc_min", "")); filter_voc_max.set(filters.get("voc_max", ""))
+            filter_jsc_min.set(filters.get("jsc_min", "")); filter_jsc_max.set(filters.get("jsc_max", ""))
+            filter_ff_min.set(filters.get("ff_min", "")); filter_ff_max.set(filters.get("ff_max", ""))
+            filter_pce_min.set(filters.get("pce_min", "")); filter_pce_max.set(filters.get("pce_max", ""))
+            apply_filter() # Apply filter values to the merged data
 
-        # 3. Apply filters
-        filters = state.get('filters', {})
-        filter_voc_min.set(filters.get("voc_min", "")); filter_voc_max.set(filters.get("voc_max", ""))
-        filter_jsc_min.set(filters.get("jsc_min", "")); filter_jsc_max.set(filters.get("jsc_max", ""))
-        filter_ff_min.set(filters.get("ff_min", "")); filter_ff_max.set(filters.get("ff_max", ""))
-        filter_pce_min.set(filters.get("pce_min", "")); filter_pce_max.set(filters.get("pce_max", ""))
-        apply_filter() # Apply filter values to the merged data
+            # 4. Set Scan filters
+            scan_filters = state.get('scan_filters', {})
+            scan_filter_jv_var.set(scan_filters.get('jv', 'All'))
+            scan_filter_dist_var.set(scan_filters.get('dist', 'All'))
 
+            # 5. Set Variable Check states
+            var_check_states = state.get('var_check_states', {})
+            for col, is_checked in var_check_states.items():
+                if col in var_checkbox_vars:
+                    var_checkbox_vars[col].set(is_checked)
 
-        # 4. Set Scan filters
-        scan_filters = state.get('scan_filters', {})
-        scan_filter_jv_var.set(scan_filters.get('jv', 'All'))
-        scan_filter_dist_var.set(scan_filters.get('dist', 'All'))
+            # 5-2. [신규] 축 범위(Axis Range) 복원
+            jv_axes = state.get('jv_axes', {})
+            jv_x_min_var.set(jv_axes.get('x_min', ''))
+            jv_x_max_var.set(jv_axes.get('x_max', ''))
+            jv_y_min_var.set(jv_axes.get('y_min', ''))
+            jv_y_max_var.set(jv_axes.get('y_max', ''))
 
-        # 5. Set Variable Check states
-        var_check_states = state.get('var_check_states', {})
-        for col, is_checked in var_check_states.items():
-            if col in var_checkbox_vars:
-                var_checkbox_vars[col].set(is_checked)
+            dist_axes = state.get('dist_axes', {})
+            dist_voc_min_var.set(dist_axes.get('voc_min', ''))
+            dist_voc_max_var.set(dist_axes.get('voc_max', ''))
+            dist_jsc_min_var.set(dist_axes.get('jsc_min', ''))
+            dist_jsc_max_var.set(dist_axes.get('jsc_max', ''))
+            dist_ff_min_var.set(dist_axes.get('ff_min', ''))
+            dist_ff_max_var.set(dist_axes.get('ff_max', ''))
+            dist_pce_min_var.set(dist_axes.get('pce_min', ''))
+            dist_pce_max_var.set(dist_axes.get('pce_max', ''))
 
-        # 5-2. [신규] 축 범위(Axis Range) 복원
-        jv_axes = state.get('jv_axes', {})
-        jv_x_min_var.set(jv_axes.get('x_min', ''))
-        jv_x_max_var.set(jv_axes.get('x_max', ''))
-        jv_y_min_var.set(jv_axes.get('y_min', ''))
-        jv_y_max_var.set(jv_axes.get('y_max', ''))
-
-        dist_axes = state.get('dist_axes', {})
-        dist_voc_min_var.set(dist_axes.get('voc_min', ''))
-        dist_voc_max_var.set(dist_axes.get('voc_max', ''))
-        dist_jsc_min_var.set(dist_axes.get('jsc_min', ''))
-        dist_jsc_max_var.set(dist_axes.get('jsc_max', ''))
-        dist_ff_min_var.set(dist_axes.get('ff_min', ''))
-        dist_ff_max_var.set(dist_axes.get('ff_max', ''))
-        dist_pce_min_var.set(dist_axes.get('pce_min', ''))
-        dist_pce_max_var.set(dist_axes.get('pce_max', ''))
-
-        # 6. Refresh UI completely with merged and filtered data
-        # apply_filter() already calls refresh_all_views
-        # refresh_all_views(current_display_df)
-
-
-        # 7. Restore Plots
-        clear_jv_plot()
-        for item_id, plot_info in state.get('jv_plots', {}).items():
-             # Check if the file path exists in the current (potentially filtered) data
-            if plot_info['path'] in current_display_df['FullPath'].values:
-                df = jv_data_cache.get(plot_info['path'])
-                if df is not None:
-                    color_img = create_color_image(plot_info['color'])
-                    new_id = plotted_list_tree.insert('', 'end', text=plot_info['label'], image=color_img)
-                    plotted_jv_items[new_id] = {
-                        'path': plot_info['path'], 'label': plot_info['label'],
-                        'color': plot_info['color'], 'df': df, 'image': color_img,
-                        'marker': plot_info.get('marker', 'o'),
-                        'linestyle': plot_info.get('linestyle', '-'),
-                        # Restore scan direction info if needed for labels, etc.
-                        'scan_dir': current_display_df.loc[current_display_df['FullPath'] == plot_info['path'], 'Scan Direction'].iloc[0]
-                    }
-            else:
-                 print(f"Warning: J-V plot item for '{plot_info['path']}' not found in current data after loading state. Skipping.")
-        redraw_jv_graphs()
-
-        clear_dist_plot()
-        for item_id, plot_info in state.get('dist_plots', {}).items():
-            # Check if the folder name (label) still exists after merge/filter
-            if plot_info['label'] in current_display_df['Sample'].unique():
-                color_img = create_color_image(plot_info['color'])
-                new_id = dist_list_tree.insert('', 'end', text=plot_info['label'], image=color_img)
-                plotted_dist_items[new_id] = {'label': plot_info['label'], 'color': plot_info['color'], 'image': color_img}
-            else:
-                print(f"Warning: Distribution plot item '{plot_info['label']}' not found in current data after loading state. Skipping.")
-        redraw_dist_plot()
-        
-        # 8. Restore Legend Settings
-        jv_legend = state.get('jv_legend', {})
-        if jv_legend:
-            jv_legend_fontsize_var.set(jv_legend.get('fontsize', 'x-small'))
-            jv_legend_loc_var.set(jv_legend.get('loc', 'best'))
-            jv_legend_ncol_var.set(jv_legend.get('ncol', 'Auto'))
+            # 7. Restore Plots
+            clear_jv_plot()
+            for item_id, plot_info in state.get('jv_plots', {}).items():
+                 # Check if the file path exists in the current (potentially filtered) data
+                if plot_info['path'] in current_display_df['FullPath'].values:
+                    df = jv_data_cache.get(plot_info['path'])
+                    if df is not None:
+                        color_img = create_color_image(plot_info['color'])
+                        new_id = plotted_list_tree.insert('', 'end', text=plot_info['label'], image=color_img)
+                        plotted_jv_items[new_id] = {
+                            'path': plot_info['path'], 'label': plot_info['label'],
+                            'color': plot_info['color'], 'df': df, 'image': color_img,
+                            'marker': plot_info.get('marker', 'o'),
+                            'linestyle': plot_info.get('linestyle', '-'),
+                            # Restore scan direction info if needed for labels, etc.
+                            'scan_dir': current_display_df.loc[current_display_df['FullPath'] == plot_info['path'], 'Scan Direction'].iloc[0]
+                        }
+                else:
+                     print(f"Warning: J-V plot item for '{plot_info['path']}' not found in current data after loading state. Skipping.")
             redraw_jv_graphs()
 
-        messagebox.showinfo("Success", f"Analysis state loaded from:\n{filepath}")
+            clear_dist_plot()
+            for item_id, plot_info in state.get('dist_plots', {}).items():
+                # Check if the folder name (label) still exists after merge/filter
+                if plot_info['label'] in current_display_df['Sample'].unique():
+                    color_img = create_color_image(plot_info['color'])
+                    new_id = dist_list_tree.insert('', 'end', text=plot_info['label'], image=color_img)
+                    plotted_dist_items[new_id] = {'label': plot_info['label'], 'color': plot_info['color'], 'image': color_img}
+                else:
+                    print(f"Warning: Distribution plot item '{plot_info['label']}' not found in current data after loading state. Skipping.")
+            redraw_dist_plot()
+            
+            # 8. Restore Legend Settings
+            jv_legend = state.get('jv_legend', {})
+            if jv_legend:
+                jv_legend_fontsize_var.set(jv_legend.get('fontsize', 'x-small'))
+                jv_legend_loc_var.set(jv_legend.get('loc', 'best'))
+                jv_legend_ncol_var.set(jv_legend.get('ncol', 'Auto'))
+                redraw_jv_graphs()
+
+            messagebox.showinfo("Success", f"Analysis state loaded from:\n{filepath}")
+
+        # 1. Load data from the saved root folder first
+        # [수정] 이 함수는 is_fresh_load=False로 실행되어 팝업을 띄우지 않습니다.
+        load_and_process_folder(state['root_folder'], on_complete=finish_load_state) # This resets current_display_df to original
 
 
     except FileNotFoundError:
@@ -3956,700 +3978,703 @@ def open_stability_window():
     StabilityAnalysisWindow(root, target_xlsx_path, sample_name)
 
 # --- GUI 창 생성 및 레이아웃 설정 ---
-root = ThemedTk(theme="arc")
-root.title("Solar Cell J-V & Statistics Analyzer v3.3")
-root.state('zoomed')
-root.protocol("WM_DELETE_WINDOW", on_closing)
+if __name__ == '__main__':
+    import multiprocessing
+    multiprocessing.freeze_support()
+    root = ThemedTk(theme="arc")
+    root.title("Solar Cell J-V & Statistics Analyzer v3.3")
+    root.state('zoomed')
+    root.protocol("WM_DELETE_WINDOW", on_closing)
 
-# --- Menu Bar ---
-menubar = tk.Menu(root)
-root.config(menu=menubar)
-file_menu = tk.Menu(menubar, tearoff=0)
-file_menu.add_command(label="Open Folder...", command=load_and_process_folder)
-file_menu.add_separator()
-file_menu.add_command(label="Save Analysis State...", command=save_state)
-file_menu.add_command(label="Load Analysis State...", command=load_state)
-file_menu.add_separator()
-file_menu.add_command(label="Save Variable Recipe...", command=save_variable_recipe)
-file_menu.add_command(label="Load Variable Recipe...", command=load_variable_recipe)
-file_menu.add_separator()
-file_menu.add_command(label="Export to PowerPoint...", command=export_to_powerpoint)
-file_menu.add_command(label="Export for ML (.csv/xlsx)...", command=export_for_ml)
-file_menu.add_separator()
-file_menu.add_command(label="Exit", command=on_closing)
-menubar.add_cascade(label="File", menu=file_menu)
+    # --- Menu Bar ---
+    menubar = tk.Menu(root)
+    root.config(menu=menubar)
+    file_menu = tk.Menu(menubar, tearoff=0)
+    file_menu.add_command(label="Open Folder...", command=load_and_process_folder)
+    file_menu.add_separator()
+    file_menu.add_command(label="Save Analysis State...", command=save_state)
+    file_menu.add_command(label="Load Analysis State...", command=load_state)
+    file_menu.add_separator()
+    file_menu.add_command(label="Save Variable Recipe...", command=save_variable_recipe)
+    file_menu.add_command(label="Load Variable Recipe...", command=load_variable_recipe)
+    file_menu.add_separator()
+    file_menu.add_command(label="Export to PowerPoint...", command=export_to_powerpoint)
+    file_menu.add_command(label="Export for ML (.csv/xlsx)...", command=export_for_ml)
+    file_menu.add_separator()
+    file_menu.add_command(label="Exit", command=on_closing)
+    menubar.add_cascade(label="File", menu=file_menu)
 
-edit_menu = tk.Menu(menubar, tearoff=0)
-edit_menu.add_command(label="Auto Merge Folders by Number", command=auto_merge_folders)
-edit_menu.add_command(label="Last 4 JV data", command=filter_last_four_files)
-menubar.add_cascade(label="Edit", menu=edit_menu)
+    edit_menu = tk.Menu(menubar, tearoff=0)
+    edit_menu.add_command(label="Auto Merge Folders by Number", command=auto_merge_folders)
+    edit_menu.add_command(label="Last 4 JV data", command=filter_last_four_files)
+    menubar.add_cascade(label="Edit", menu=edit_menu)
 
-# 3. [신규] Stability Menu
-stability_menu = tk.Menu(menubar, tearoff=0)
-stability_menu.add_command(label="View MPPT/SPO/QSS Data", command=open_stability_window)
-menubar.add_cascade(label="Stability", menu=stability_menu)
+    # 3. [신규] Stability Menu
+    stability_menu = tk.Menu(menubar, tearoff=0)
+    stability_menu.add_command(label="View MPPT/SPO/QSS Data", command=open_stability_window)
+    menubar.add_cascade(label="Stability", menu=stability_menu)
 
-# 4. View Menu
-view_menu = tk.Menu(menubar, tearoff=0)
-theme_menu = tk.Menu(view_menu, tearoff=0)
-view_menu.add_cascade(label="Change Theme", menu=theme_menu)
-menubar.add_cascade(label="View", menu=view_menu)
-theme_var = tk.StringVar(value="arc")
-for t in sorted(root.get_themes()):
-    theme_menu.add_radiobutton(label=t, variable=theme_var, command=lambda t=t: root.set_theme(t))
+    # 4. View Menu
+    view_menu = tk.Menu(menubar, tearoff=0)
+    theme_menu = tk.Menu(view_menu, tearoff=0)
+    view_menu.add_cascade(label="Change Theme", menu=theme_menu)
+    menubar.add_cascade(label="View", menu=view_menu)
+    theme_var = tk.StringVar(value="arc")
+    for t in sorted(root.get_themes()):
+        theme_menu.add_radiobutton(label=t, variable=theme_var, command=lambda t=t: root.set_theme(t))
 
-# --- Main Layout ---
-main_paned_window = ttk.PanedWindow(root, orient=tk.VERTICAL)
-main_paned_window.pack(fill=tk.BOTH, expand=True)
-top_frame = ttk.Frame(main_paned_window)
-bottom_frame = ttk.Frame(main_paned_window)
-main_paned_window.add(top_frame)
-main_paned_window.add(bottom_frame)
+    # --- Main Layout ---
+    main_paned_window = ttk.PanedWindow(root, orient=tk.VERTICAL)
+    main_paned_window.pack(fill=tk.BOTH, expand=True)
+    top_frame = ttk.Frame(main_paned_window)
+    bottom_frame = ttk.Frame(main_paned_window)
+    main_paned_window.add(top_frame)
+    main_paned_window.add(bottom_frame)
 
-def adjust_sash(event=None): # [수정 1] (event=None) 추가
-    main_paned_window.update_idletasks()
-    try:
-        # 1. 창의 전체 세로 높이를 가져옵니다.
-        total_height = main_paned_window.winfo_height()
+    def adjust_sash(event=None): # [수정 1] (event=None) 추가
+        main_paned_window.update_idletasks()
+        try:
+            # 1. 창의 전체 세로 높이를 가져옵니다.
+            total_height = main_paned_window.winfo_height()
         
-        # 2. 하단 패널(변수/테이블)이 최소한 이만큼 보이도록 높이를 지정 (픽셀 단위)
-        desired_bottom_height = 280 # [수정] 380 -> 280 (그래프 영역 확장을 위해 하단 축소)
+            # 2. 하단 패널(변수/테이블)이 최소한 이만큼 보이도록 높이를 지정 (픽셀 단위)
+            desired_bottom_height = 280 # [수정] 380 -> 280 (그래프 영역 확장을 위해 하단 축소)
         
-        # 3. 상단 그래프 영역의 최소 높이도 지정 (너무 줄어들지 않게)
-        min_top_height = 400 # [수정] 300 -> 400
+            # 3. 상단 그래프 영역의 최소 높이도 지정 (너무 줄어들지 않게)
+            min_top_height = 400 # [수정] 300 -> 400
 
-        # 4. 창의 전체 높이가 두 영역의 최소 합보다 클 때만 실행
-        if total_height > (desired_bottom_height + min_top_height):
-            # 5. SASH의 Y좌표를 (전체 높이 - 하단 높이)로 계산
-            sash_y_position = total_height - desired_bottom_height
-            main_paned_window.sash_place(0, 0, sash_y_position)
-        else:
-            # 6. 창이 너무 작아서 최소 높이를 확보할 수 없는 경우 (예: 600px)
-            #    그냥 65% 비율로 설정 (이전 코드)
-            main_paned_window.sash_place(0, 0, int(total_height * 0.4))
+            # 4. 창의 전체 높이가 두 영역의 최소 합보다 클 때만 실행
+            if total_height > (desired_bottom_height + min_top_height):
+                # 5. SASH의 Y좌표를 (전체 높이 - 하단 높이)로 계산
+                sash_y_position = total_height - desired_bottom_height
+                main_paned_window.sash_place(0, 0, sash_y_position)
+            else:
+                # 6. 창이 너무 작아서 최소 높이를 확보할 수 없는 경우 (예: 600px)
+                #    그냥 65% 비율로 설정 (이전 코드)
+                main_paned_window.sash_place(0, 0, int(total_height * 0.4))
             
-    except tk.TclError: 
-        pass
-main_paned_window.bind("<Configure>", adjust_sash)
+        except tk.TclError: 
+            pass
+    main_paned_window.bind("<Configure>", adjust_sash)
 
-left_pane = ttk.Frame(top_frame, width=320) # [수정] 400 -> 320
-left_pane.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=5, pady=5)
-right_paned_window = ttk.PanedWindow(top_frame, orient=tk.HORIZONTAL)
-right_paned_window.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+    left_pane = ttk.Frame(top_frame, width=320) # [수정] 400 -> 320
+    left_pane.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=5, pady=5)
+    right_paned_window = ttk.PanedWindow(top_frame, orient=tk.HORIZONTAL)
+    right_paned_window.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-# --- Left Control Panel ---
-left_pane.rowconfigure(1, weight=1); left_pane.columnconfigure(0, weight=1)
+    # --- Left Control Panel ---
+    left_pane.rowconfigure(1, weight=1); left_pane.columnconfigure(0, weight=1)
 
-tree_label_frame = ttk.LabelFrame(left_pane, text="Sample / File Name")
-tree_label_frame.grid(row=1, column=0, columnspan=2, sticky='nsew', pady=5)
-tree_label_frame.rowconfigure(1, weight=1)
-tree_label_frame.columnconfigure(0, weight=1)
-tree_button_frame = ttk.Frame(tree_label_frame)
-tree_button_frame.grid(row=0, column=0, sticky='ew')
-ttk.Button(tree_button_frame, text="Expand All", command=expand_all_folders).pack(side=tk.LEFT, expand=True, fill=tk.X)
-ttk.Button(tree_button_frame, text="Collapse All", command=collapse_all_folders).pack(side=tk.LEFT, expand=True, fill=tk.X)
-ttk.Button(tree_button_frame, text="Best/Folder", command=filter_best_pce_per_folder).pack(side=tk.LEFT, expand=True, fill=tk.X)
-tree_view_frame = ttk.Frame(tree_label_frame)
-tree_view_frame.grid(row=1, column=0, sticky='nsew')
-file_tree_scrollbar = ttk.Scrollbar(tree_view_frame)
-file_tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-file_tree = ttk.Treeview(tree_view_frame, yscrollcommand=file_tree_scrollbar.set, selectmode='extended')
-file_tree.pack(fill=tk.BOTH, expand=True)
-file_tree_scrollbar.config(command=file_tree.yview)
-file_tree.heading('#0', text='Sample / File', anchor='w')
-# [신규] 최고 효율 항목 강조를 위한 태그 설정
-file_tree.tag_configure('best_pce', font='Helvetica 9 bold')
-# [신규] 비정상 데이터 강조를 위한 태그 설정 (빨간색 텍스트)
-file_tree.tag_configure('abnormal', foreground='red')
+    tree_label_frame = ttk.LabelFrame(left_pane, text="Sample / File Name")
+    tree_label_frame.grid(row=1, column=0, columnspan=2, sticky='nsew', pady=5)
+    tree_label_frame.rowconfigure(1, weight=1)
+    tree_label_frame.columnconfigure(0, weight=1)
+    tree_button_frame = ttk.Frame(tree_label_frame)
+    tree_button_frame.grid(row=0, column=0, sticky='ew')
+    ttk.Button(tree_button_frame, text="Expand All", command=expand_all_folders).pack(side=tk.LEFT, expand=True, fill=tk.X)
+    ttk.Button(tree_button_frame, text="Collapse All", command=collapse_all_folders).pack(side=tk.LEFT, expand=True, fill=tk.X)
+    ttk.Button(tree_button_frame, text="Best/Folder", command=filter_best_pce_per_folder).pack(side=tk.LEFT, expand=True, fill=tk.X)
+    tree_view_frame = ttk.Frame(tree_label_frame)
+    tree_view_frame.grid(row=1, column=0, sticky='nsew')
+    file_tree_scrollbar = ttk.Scrollbar(tree_view_frame)
+    file_tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    file_tree = ttk.Treeview(tree_view_frame, yscrollcommand=file_tree_scrollbar.set, selectmode='extended')
+    file_tree.pack(fill=tk.BOTH, expand=True)
+    file_tree_scrollbar.config(command=file_tree.yview)
+    file_tree.heading('#0', text='Sample / File', anchor='w')
+    # [신규] 최고 효율 항목 강조를 위한 태그 설정
+    file_tree.tag_configure('best_pce', font='Helvetica 9 bold')
+    # [신규] 비정상 데이터 강조를 위한 태그 설정 (빨간색 텍스트)
+    file_tree.tag_configure('abnormal', foreground='red')
 
-jv_add_button = ttk.Button(left_pane, text="Add File(s) to J-V Plot", command=add_selected_to_jv_graph)
-jv_add_button.grid(row=2, column=0, sticky='ew', padx=2)
-dist_add_button = ttk.Button(left_pane, text="Add Folder(s) to Dist. Plot", command=add_selected_folder_to_dist_plot)
-dist_add_button.grid(row=2, column=1, sticky='ew', padx=2)
+    jv_add_button = ttk.Button(left_pane, text="Add File(s) to J-V Plot", command=add_selected_to_jv_graph)
+    jv_add_button.grid(row=2, column=0, sticky='ew', padx=2)
+    dist_add_button = ttk.Button(left_pane, text="Add Folder(s) to Dist. Plot", command=add_selected_folder_to_dist_plot)
+    dist_add_button.grid(row=2, column=1, sticky='ew', padx=2)
 
-# --- [수정] Merge 및 Delete 버튼을 나란히 배치하기 위해 프레임 생성 ---
-merge_delete_frame = ttk.Frame(left_pane)
-merge_delete_frame.grid(row=3, column=0, columnspan=2, sticky='ew', padx=5, pady=(5, 0))
+    # --- [수정] Merge 및 Delete 버튼을 나란히 배치하기 위해 프레임 생성 ---
+    merge_delete_frame = ttk.Frame(left_pane)
+    merge_delete_frame.grid(row=3, column=0, columnspan=2, sticky='ew', padx=5, pady=(5, 0))
 
-merge_button = ttk.Button(merge_delete_frame, text="Merge Folders", command=merge_selected_folders)
-merge_button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
+    merge_button = ttk.Button(merge_delete_frame, text="Merge Folders", command=merge_selected_folders)
+    merge_button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
 
-delete_button = ttk.Button(merge_delete_frame, text="Delete Folder(s)", command=delete_selected_samples)
-delete_button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 0))
+    delete_button = ttk.Button(merge_delete_frame, text="Delete Folder(s)", command=delete_selected_samples)
+    delete_button.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 0))
 
-manage_vars_button = ttk.Button(left_pane, text="Manage Variables...", command=open_variable_manager)
-manage_vars_button.grid(row=4, column=0, columnspan=2, sticky='ew', padx=5, pady=(5, 0))
+    manage_vars_button = ttk.Button(left_pane, text="Manage Variables...", command=open_variable_manager)
+    manage_vars_button.grid(row=4, column=0, columnspan=2, sticky='ew', padx=5, pady=(5, 0))
 
-filter_frame = ttk.LabelFrame(left_pane, text="Data Filter")
-filter_frame.grid(row=5, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
-filter_voc_min, filter_voc_max = tk.StringVar(), tk.StringVar(); filter_jsc_min, filter_jsc_max = tk.StringVar(), tk.StringVar()
-filter_ff_min, filter_ff_max = tk.StringVar(), tk.StringVar(); filter_pce_min, filter_pce_max = tk.StringVar(), tk.StringVar()
-filter_vars = [("Voc", filter_voc_min, filter_voc_max), ("Jsc", filter_jsc_min, filter_jsc_max),
-               ("FF", filter_ff_min, filter_ff_max), ("PCE", filter_pce_min, filter_pce_max)]
-for i, (name, min_var, max_var) in enumerate(filter_vars):
-    ttk.Label(filter_frame, text=name).grid(row=i, column=0, padx=2)
-    ttk.Entry(filter_frame, textvariable=min_var, width=8).grid(row=i, column=1)
-    ttk.Label(filter_frame, text="~").grid(row=i, column=2)
-    ttk.Entry(filter_frame, textvariable=max_var, width=8).grid(row=i, column=3)
-filter_btn_frame = ttk.Frame(filter_frame)
-filter_btn_frame.grid(row=0, column=4, rowspan=4, padx=5)
-ttk.Button(filter_btn_frame, text="Apply\nFilter", command=apply_filter).pack(fill=tk.X, pady=2)
-ttk.Button(filter_btn_frame, text="Reset\nFilter", command=reset_filter).pack(fill=tk.X, pady=2)
+    filter_frame = ttk.LabelFrame(left_pane, text="Data Filter")
+    filter_frame.grid(row=5, column=0, columnspan=2, sticky='ew', padx=5, pady=5)
+    filter_voc_min, filter_voc_max = tk.StringVar(), tk.StringVar(); filter_jsc_min, filter_jsc_max = tk.StringVar(), tk.StringVar()
+    filter_ff_min, filter_ff_max = tk.StringVar(), tk.StringVar(); filter_pce_min, filter_pce_max = tk.StringVar(), tk.StringVar()
+    filter_vars = [("Voc", filter_voc_min, filter_voc_max), ("Jsc", filter_jsc_min, filter_jsc_max),
+                   ("FF", filter_ff_min, filter_ff_max), ("PCE", filter_pce_min, filter_pce_max)]
+    for i, (name, min_var, max_var) in enumerate(filter_vars):
+        ttk.Label(filter_frame, text=name).grid(row=i, column=0, padx=2)
+        ttk.Entry(filter_frame, textvariable=min_var, width=8).grid(row=i, column=1)
+        ttk.Label(filter_frame, text="~").grid(row=i, column=2)
+        ttk.Entry(filter_frame, textvariable=max_var, width=8).grid(row=i, column=3)
+    filter_btn_frame = ttk.Frame(filter_frame)
+    filter_btn_frame.grid(row=0, column=4, rowspan=4, padx=5)
+    ttk.Button(filter_btn_frame, text="Apply\nFilter", command=apply_filter).pack(fill=tk.X, pady=2)
+    ttk.Button(filter_btn_frame, text="Reset\nFilter", command=reset_filter).pack(fill=tk.X, pady=2)
 
-# --- Right Graph Panels ---
-jv_graph_frame = ttk.LabelFrame(right_paned_window, text="J-V Curve")
-dist_graph_frame = ttk.LabelFrame(right_paned_window, text="Parameter Distribution")
-right_paned_window.add(jv_graph_frame, weight=1)
-right_paned_window.add(dist_graph_frame, weight=1)
+    # --- Right Graph Panels ---
+    jv_graph_frame = ttk.LabelFrame(right_paned_window, text="J-V Curve")
+    dist_graph_frame = ttk.LabelFrame(right_paned_window, text="Parameter Distribution")
+    right_paned_window.add(jv_graph_frame, weight=1)
+    right_paned_window.add(dist_graph_frame, weight=1)
 
-# --- J-V Graph Widgets ---
-# [수정] constrained_layout=True를 사용하여 범례가 많을 때 그래프가 찌그러지는 현상을 방지합니다.
-fig_jv, ax_jv = plt.subplots(facecolor='white', figsize=(5, 5), constrained_layout=True)
-jv_canvas_widget = FigureCanvasTkAgg(fig_jv, master=jv_graph_frame)
-jv_canvas_widget.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-jv_toolbar_frame = ttk.Frame(jv_graph_frame)
-jv_toolbar_frame.pack(side=tk.BOTTOM, fill=tk.X)
-toolbar = NavigationToolbar2Tk(jv_canvas_widget, jv_toolbar_frame)
-toolbar.update()
-ttk.Button(jv_toolbar_frame, text="Copy Graph", command=lambda: copy_figure_to_clipboard(fig_jv)).pack(side=tk.RIGHT, padx=5)
+    # --- J-V Graph Widgets ---
+    # [수정] constrained_layout=True를 사용하여 범례가 많을 때 그래프가 찌그러지는 현상을 방지합니다.
+    fig_jv, ax_jv = plt.subplots(facecolor='white', figsize=(5, 5), constrained_layout=True)
+    jv_canvas_widget = FigureCanvasTkAgg(fig_jv, master=jv_graph_frame)
+    jv_canvas_widget.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+    jv_toolbar_frame = ttk.Frame(jv_graph_frame)
+    jv_toolbar_frame.pack(side=tk.BOTTOM, fill=tk.X)
+    toolbar = NavigationToolbar2Tk(jv_canvas_widget, jv_toolbar_frame)
+    toolbar.update()
+    ttk.Button(jv_toolbar_frame, text="Copy Graph", command=lambda: copy_figure_to_clipboard(fig_jv)).pack(side=tk.RIGHT, padx=5)
 
-# --- [추가] Raw Table 복사 버튼 ---
-ttk.Button(jv_toolbar_frame, text="Copy Raw Table", command=copy_jv_raw_data).pack(side=tk.RIGHT, padx=5)
-# --- [추가 끝] ---
+    # --- [추가] Raw Table 복사 버튼 ---
+    ttk.Button(jv_toolbar_frame, text="Copy Raw Table", command=copy_jv_raw_data).pack(side=tk.RIGHT, padx=5)
+    # --- [추가 끝] ---
 
-scan_filter_jv_var = tk.StringVar(value='All')
-ttk.Label(jv_toolbar_frame, text="Scan:").pack(side=tk.RIGHT, padx=(5,2))
-scan_combo_jv = ttk.Combobox(jv_toolbar_frame, textvariable=scan_filter_jv_var, values=['All', 'Reverse', 'Forward'], state='readonly', width=10)
-scan_combo_jv.pack(side=tk.RIGHT, padx=2)
-scan_combo_jv.bind('<<ComboboxSelected>>', lambda e: redraw_jv_graphs() if plotted_jv_items else None)
-jv_control_frame = ttk.Frame(jv_graph_frame)
-jv_control_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=2) # [수정] pady 4 -> 2
-# 가로 비율 조정: 리스트(0)는 매우 작게, 설정(1)은 훨씬 넓게 (1:4 비율)
-jv_control_frame.columnconfigure(0, weight=1)
-jv_control_frame.columnconfigure(1, weight=4)
+    scan_filter_jv_var = tk.StringVar(value='All')
+    ttk.Label(jv_toolbar_frame, text="Scan:").pack(side=tk.RIGHT, padx=(5,2))
+    scan_combo_jv = ttk.Combobox(jv_toolbar_frame, textvariable=scan_filter_jv_var, values=['All', 'Reverse', 'Forward'], state='readonly', width=10)
+    scan_combo_jv.pack(side=tk.RIGHT, padx=2)
+    scan_combo_jv.bind('<<ComboboxSelected>>', lambda e: redraw_jv_graphs() if plotted_jv_items else None)
+    jv_control_frame = ttk.Frame(jv_graph_frame)
+    jv_control_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=2) # [수정] pady 4 -> 2
+    # 가로 비율 조정: 리스트(0)는 매우 작게, 설정(1)은 훨씬 넓게 (1:4 비율)
+    jv_control_frame.columnconfigure(0, weight=1)
+    jv_control_frame.columnconfigure(1, weight=4)
 
-plotted_list_frame = ttk.LabelFrame(jv_control_frame, text="Plotted J-V Curves (Double-click to edit)")
-plotted_list_frame.grid(row=0, column=0, sticky='nsew', padx=(0,3))
-plotted_list_tree = ttk.Treeview(plotted_list_frame, show='tree', height=2) # [수정] height 4 -> 2
-plotted_list_tree.pack(fill=tk.BOTH, expand=True) 
-# 리스트 영역 너비 강제 축소를 위해 컬럼 너비 설정
-plotted_list_tree.column("#0", width=150, minwidth=100)
-plotted_list_tree.bind("<Double-1>", lambda event: on_plotted_item_double_click(event, plotted_jv_items, plotted_list_tree))
+    plotted_list_frame = ttk.LabelFrame(jv_control_frame, text="Plotted J-V Curves (Double-click to edit)")
+    plotted_list_frame.grid(row=0, column=0, sticky='nsew', padx=(0,3))
+    plotted_list_tree = ttk.Treeview(plotted_list_frame, show='tree', height=2) # [수정] height 4 -> 2
+    plotted_list_tree.pack(fill=tk.BOTH, expand=True) 
+    # 리스트 영역 너비 강제 축소를 위해 컬럼 너비 설정
+    plotted_list_tree.column("#0", width=150, minwidth=100)
+    plotted_list_tree.bind("<Double-1>", lambda event: on_plotted_item_double_click(event, plotted_jv_items, plotted_list_tree))
 
-jv_buttons_frame = ttk.Frame(plotted_list_frame)
-jv_buttons_frame.pack(fill=tk.X, pady=2)
+    jv_buttons_frame = ttk.Frame(plotted_list_frame)
+    jv_buttons_frame.pack(fill=tk.X, pady=2)
 
-# 버튼들을 2행으로 배치하여 프레임의 가로 길이를 축소
-btn_row1 = ttk.Frame(jv_buttons_frame)
-btn_row1.pack(fill=tk.X)
-ttk.Button(btn_row1, text="Remove Selected", command=remove_selected_from_jv_graph).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
-ttk.Button(btn_row1, text="Clear All", command=clear_jv_plot).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
+    # 버튼들을 2행으로 배치하여 프레임의 가로 길이를 축소
+    btn_row1 = ttk.Frame(jv_buttons_frame)
+    btn_row1.pack(fill=tk.X)
+    ttk.Button(btn_row1, text="Remove Selected", command=remove_selected_from_jv_graph).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
+    ttk.Button(btn_row1, text="Clear All", command=clear_jv_plot).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
 
 
 
-btn_row2 = ttk.Frame(jv_buttons_frame)
-btn_row2.pack(fill=tk.X, pady=(1, 0))
-ttk.Button(btn_row2, text="▲ Up", width=5, command=lambda: move_tree_item(plotted_list_tree, -1, redraw_jv_graphs)).pack(side=tk.LEFT, padx=1)
-ttk.Button(btn_row2, text="▼ Down", width=5, command=lambda: move_tree_item(plotted_list_tree, 1, redraw_jv_graphs)).pack(side=tk.LEFT, padx=1)
-ttk.Button(btn_row2, text="Plot Best PCEs", command=plot_best_pces).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
+    btn_row2 = ttk.Frame(jv_buttons_frame)
+    btn_row2.pack(fill=tk.X, pady=(1, 0))
+    ttk.Button(btn_row2, text="▲ Up", width=5, command=lambda: move_tree_item(plotted_list_tree, -1, redraw_jv_graphs)).pack(side=tk.LEFT, padx=1)
+    ttk.Button(btn_row2, text="▼ Down", width=5, command=lambda: move_tree_item(plotted_list_tree, 1, redraw_jv_graphs)).pack(side=tk.LEFT, padx=1)
+    ttk.Button(btn_row2, text="Plot Best PCEs", command=plot_best_pces).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
 
-# --- [수정] 제어 패널들을 세로로 쌓기 위한 내부 프레임 생성 ---
-jv_settings_inner_frame = ttk.Frame(jv_control_frame)
-jv_settings_inner_frame.grid(row=0, column=1, sticky='nsew', padx=3)
+    # --- [수정] 제어 패널들을 세로로 쌓기 위한 내부 프레임 생성 ---
+    jv_settings_inner_frame = ttk.Frame(jv_control_frame)
+    jv_settings_inner_frame.grid(row=0, column=1, sticky='nsew', padx=3)
 
-# Axis Range
-jv_axis_manage_frame = ttk.LabelFrame(jv_settings_inner_frame, text="J-V Axis Range")
-jv_axis_manage_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
-jv_x_min_var, jv_x_max_var = tk.StringVar(), tk.StringVar()
-jv_y_min_var, jv_y_max_var = tk.StringVar(), tk.StringVar()
-ttk.Label(jv_axis_manage_frame, text="X min:").grid(row=0, column=0); ttk.Entry(jv_axis_manage_frame, textvariable=jv_x_min_var, width=7).grid(row=0, column=1)
-ttk.Label(jv_axis_manage_frame, text="X max:").grid(row=0, column=2); ttk.Entry(jv_axis_manage_frame, textvariable=jv_x_max_var, width=7).grid(row=0, column=3)
-ttk.Label(jv_axis_manage_frame, text="Y min:").grid(row=1, column=0); ttk.Entry(jv_axis_manage_frame, textvariable=jv_y_min_var, width=7).grid(row=1, column=1)
-ttk.Label(jv_axis_manage_frame, text="Y max:").grid(row=1, column=2); ttk.Entry(jv_axis_manage_frame, textvariable=jv_y_max_var, width=7).grid(row=1, column=3)
-ttk.Button(jv_axis_manage_frame, text="Apply", command=update_jv_axis_limits).grid(row=0, column=4, rowspan=2, padx=3)
-ttk.Button(jv_axis_manage_frame, text="Auto", command=auto_scale_jv_axes).grid(row=0, column=5, rowspan=2, padx=3)
+    # Axis Range
+    jv_axis_manage_frame = ttk.LabelFrame(jv_settings_inner_frame, text="J-V Axis Range")
+    jv_axis_manage_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
+    jv_x_min_var, jv_x_max_var = tk.StringVar(), tk.StringVar()
+    jv_y_min_var, jv_y_max_var = tk.StringVar(), tk.StringVar()
+    ttk.Label(jv_axis_manage_frame, text="X min:").grid(row=0, column=0); ttk.Entry(jv_axis_manage_frame, textvariable=jv_x_min_var, width=7).grid(row=0, column=1)
+    ttk.Label(jv_axis_manage_frame, text="X max:").grid(row=0, column=2); ttk.Entry(jv_axis_manage_frame, textvariable=jv_x_max_var, width=7).grid(row=0, column=3)
+    ttk.Label(jv_axis_manage_frame, text="Y min:").grid(row=1, column=0); ttk.Entry(jv_axis_manage_frame, textvariable=jv_y_min_var, width=7).grid(row=1, column=1)
+    ttk.Label(jv_axis_manage_frame, text="Y max:").grid(row=1, column=2); ttk.Entry(jv_axis_manage_frame, textvariable=jv_y_max_var, width=7).grid(row=1, column=3)
+    ttk.Button(jv_axis_manage_frame, text="Apply", command=update_jv_axis_limits).grid(row=0, column=4, rowspan=2, padx=3)
+    ttk.Button(jv_axis_manage_frame, text="Auto", command=auto_scale_jv_axes).grid(row=0, column=5, rowspan=2, padx=3)
 
-# Legend Control
-legend_ctrl_frame = ttk.LabelFrame(jv_settings_inner_frame, text="J-V Legend Control")
-legend_ctrl_frame.pack(side=tk.TOP, fill=tk.X, pady=(2, 0))
+    # Legend Control
+    legend_ctrl_frame = ttk.LabelFrame(jv_settings_inner_frame, text="J-V Legend Control")
+    legend_ctrl_frame.pack(side=tk.TOP, fill=tk.X, pady=(2, 0))
 
-jv_legend_fontsize_var = tk.StringVar(value='x-small')
-jv_legend_loc_var = tk.StringVar(value='best')
-jv_legend_ncol_var = tk.StringVar(value='Auto')
+    jv_legend_fontsize_var = tk.StringVar(value='x-small')
+    jv_legend_loc_var = tk.StringVar(value='best')
+    jv_legend_ncol_var = tk.StringVar(value='Auto')
 
-# Font Size
-ttk.Label(legend_ctrl_frame, text="Size:").grid(row=0, column=0, sticky='w')
-fs_options = ['xx-small', 'x-small', 'small', 'medium', 'large', '8', '9', '10', '12', '14']
-fs_combo = ttk.Combobox(legend_ctrl_frame, textvariable=jv_legend_fontsize_var, values=fs_options, width=8, state='readonly')
-fs_combo.grid(row=0, column=1, padx=2, pady=1)
-fs_combo.bind('<<ComboboxSelected>>', lambda e: redraw_jv_graphs())
+    # Font Size
+    ttk.Label(legend_ctrl_frame, text="Size:").grid(row=0, column=0, sticky='w')
+    fs_options = ['xx-small', 'x-small', 'small', 'medium', 'large', '8', '9', '10', '12', '14']
+    fs_combo = ttk.Combobox(legend_ctrl_frame, textvariable=jv_legend_fontsize_var, values=fs_options, width=8, state='readonly')
+    fs_combo.grid(row=0, column=1, padx=2, pady=1)
+    fs_combo.bind('<<ComboboxSelected>>', lambda e: redraw_jv_graphs())
 
-# Position (Location)
-ttk.Label(legend_ctrl_frame, text="Pos:").grid(row=1, column=0, sticky='w')
-loc_options = ['best', 'upper right', 'upper left', 'lower left', 'lower right', 'right', 'center left', 'center right', 'lower center', 'upper center', 'center']
-loc_combo = ttk.Combobox(legend_ctrl_frame, textvariable=jv_legend_loc_var, values=loc_options, width=11, state='readonly')
-loc_combo.grid(row=1, column=1, padx=2, pady=1)
-loc_combo.bind('<<ComboboxSelected>>', lambda e: redraw_jv_graphs())
+    # Position (Location)
+    ttk.Label(legend_ctrl_frame, text="Pos:").grid(row=1, column=0, sticky='w')
+    loc_options = ['best', 'upper right', 'upper left', 'lower left', 'lower right', 'right', 'center left', 'center right', 'lower center', 'upper center', 'center']
+    loc_combo = ttk.Combobox(legend_ctrl_frame, textvariable=jv_legend_loc_var, values=loc_options, width=11, state='readonly')
+    loc_combo.grid(row=1, column=1, padx=2, pady=1)
+    loc_combo.bind('<<ComboboxSelected>>', lambda e: redraw_jv_graphs())
 
-# Columns
-ttk.Label(legend_ctrl_frame, text="Col:").grid(row=0, column=2, sticky='w', padx=(5,0))
-ncol_options = ['Auto', '1', '2', '3', '4']
-ncol_combo = ttk.Combobox(legend_ctrl_frame, textvariable=jv_legend_ncol_var, values=ncol_options, width=5, state='readonly')
-ncol_combo.grid(row=0, column=3, padx=2, pady=1)
-ncol_combo.bind('<<ComboboxSelected>>', lambda e: redraw_jv_graphs())
+    # Columns
+    ttk.Label(legend_ctrl_frame, text="Col:").grid(row=0, column=2, sticky='w', padx=(5,0))
+    ncol_options = ['Auto', '1', '2', '3', '4']
+    ncol_combo = ttk.Combobox(legend_ctrl_frame, textvariable=jv_legend_ncol_var, values=ncol_options, width=5, state='readonly')
+    ncol_combo.grid(row=0, column=3, padx=2, pady=1)
+    ncol_combo.bind('<<ComboboxSelected>>', lambda e: redraw_jv_graphs())
 
-# --- Distribution Graph Widgets ---
-# [수정] 2x2/1x4 (컨트롤 하단) 및 4x1 (컨트롤 우측)을 지원하는 동적 레이아웃으로 변경
+    # --- Distribution Graph Widgets ---
+    # [수정] 2x2/1x4 (컨트롤 하단) 및 4x1 (컨트롤 우측)을 지원하는 동적 레이아웃으로 변경
 
-# 1. (신규) 왼쪽(그래프)과 오른쪽(컨트롤)을 나누는 프레임 2개 생성
-dist_plot_container_frame = ttk.Frame(dist_graph_frame)
-dist_controls_area_frame = ttk.Frame(dist_graph_frame) # [중요] 모든 컨트롤 위젯의 부모 프레임
+    # 1. (신규) 왼쪽(그래프)과 오른쪽(컨트롤)을 나누는 프레임 2개 생성
+    dist_plot_container_frame = ttk.Frame(dist_graph_frame)
+    dist_controls_area_frame = ttk.Frame(dist_graph_frame) # [중요] 모든 컨트롤 위젯의 부모 프레임
 
-# 1. (신규) 왼쪽(그래프), 중앙(컨트롤), 최하단(툴바)을 나누는 프레임들 생성
-dist_toolbar_frame = ttk.Frame(dist_graph_frame)
-dist_controls_area_frame = ttk.Frame(dist_graph_frame)
-dist_plot_container_frame = ttk.Frame(dist_graph_frame)
+    # 1. (신규) 왼쪽(그래프), 중앙(컨트롤), 최하단(툴바)을 나누는 프레임들 생성
+    dist_toolbar_frame = ttk.Frame(dist_graph_frame)
+    dist_controls_area_frame = ttk.Frame(dist_graph_frame)
+    dist_plot_container_frame = ttk.Frame(dist_graph_frame)
 
-# [중요] J-V와 동일하게 툴바를 가장 아래에 배치하기 위해 툴바부터 BOTTOM으로 pack
-dist_toolbar_frame.pack(side=tk.BOTTOM, fill=tk.X)
-dist_controls_area_frame.pack(side=tk.BOTTOM, fill=tk.X, expand=False, padx=5, pady=2)
-dist_plot_container_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=2)
+    # [중요] J-V와 동일하게 툴바를 가장 아래에 배치하기 위해 툴바부터 BOTTOM으로 pack
+    dist_toolbar_frame.pack(side=tk.BOTTOM, fill=tk.X)
+    dist_controls_area_frame.pack(side=tk.BOTTOM, fill=tk.X, expand=False, padx=5, pady=2)
+    dist_plot_container_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=5, pady=2)
 
-# 2. 왼쪽 프레임(dist_plot_container_frame)에 스크롤 가능한 영역 배치
-dist_plot_area_frame = ttk.Frame(dist_plot_container_frame)
-dist_plot_area_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+    # 2. 왼쪽 프레임(dist_plot_container_frame)에 스크롤 가능한 영역 배치
+    dist_plot_area_frame = ttk.Frame(dist_plot_container_frame)
+    dist_plot_area_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-# [신규] 그래프가 찌그러지는 것을 방지하기 위해 스크롤 영역 도입
-dist_canvas_scroll = tk.Canvas(dist_plot_area_frame, highlightthickness=0)
-dist_v_scrollbar = ttk.Scrollbar(dist_plot_area_frame, orient=tk.VERTICAL, command=dist_canvas_scroll.yview)
-dist_h_scrollbar = ttk.Scrollbar(dist_plot_area_frame, orient=tk.HORIZONTAL, command=dist_canvas_scroll.xview)
-dist_scrollable_frame = ttk.Frame(dist_canvas_scroll)
+    # [신규] 그래프가 찌그러지는 것을 방지하기 위해 스크롤 영역 도입
+    dist_canvas_scroll = tk.Canvas(dist_plot_area_frame, highlightthickness=0)
+    dist_v_scrollbar = ttk.Scrollbar(dist_plot_area_frame, orient=tk.VERTICAL, command=dist_canvas_scroll.yview)
+    dist_h_scrollbar = ttk.Scrollbar(dist_plot_area_frame, orient=tk.HORIZONTAL, command=dist_canvas_scroll.xview)
+    dist_scrollable_frame = ttk.Frame(dist_canvas_scroll)
 
-dist_canvas_scroll.create_window((0, 0), window=dist_scrollable_frame, anchor="nw")
-dist_canvas_scroll.configure(yscrollcommand=dist_v_scrollbar.set, xscrollcommand=dist_h_scrollbar.set)
+    dist_canvas_scroll.create_window((0, 0), window=dist_scrollable_frame, anchor="nw")
+    dist_canvas_scroll.configure(yscrollcommand=dist_v_scrollbar.set, xscrollcommand=dist_h_scrollbar.set)
 
-dist_v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-dist_h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
-dist_canvas_scroll.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    dist_v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    dist_h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+    dist_canvas_scroll.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-# 스크롤 범위 자동 갱신
-dist_scrollable_frame.bind("<Configure>", lambda e: dist_canvas_scroll.configure(scrollregion=dist_canvas_scroll.bbox("all")))
+    # 스크롤 범위 자동 갱신
+    dist_scrollable_frame.bind("<Configure>", lambda e: dist_canvas_scroll.configure(scrollregion=dist_canvas_scroll.bbox("all")))
 
-# 3. 그래프/툴바 배치 (부모를 dist_scrollable_frame으로 설정)
-fig_dist, axs_dist = plt.subplots(2, 2, facecolor='white', figsize=(7, 5))
+    # 3. 그래프/툴바 배치 (부모를 dist_scrollable_frame으로 설정)
+    fig_dist, axs_dist = plt.subplots(2, 2, facecolor='white', figsize=(7, 5))
     
-dist_canvas_widget = FigureCanvasTkAgg(fig_dist, master=dist_scrollable_frame)
-dist_canvas_widget.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+    dist_canvas_widget = FigureCanvasTkAgg(fig_dist, master=dist_scrollable_frame)
+    dist_canvas_widget.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
     
-# dist_toolbar_frame은 위에서 이미 dist_graph_frame의 BOTTOM으로 pack됨
+    # dist_toolbar_frame은 위에서 이미 dist_graph_frame의 BOTTOM으로 pack됨
     
-dist_toolbar = NavigationToolbar2Tk(dist_canvas_widget, dist_toolbar_frame)
-dist_toolbar.update()
+    dist_toolbar = NavigationToolbar2Tk(dist_canvas_widget, dist_toolbar_frame)
+    dist_toolbar.update()
     
-# 3. 툴바 프레임(dist_toolbar_frame)에 커스텀 버튼들 추가
-ttk.Button(dist_toolbar_frame, text="Copy All", command=lambda: copy_figure_to_clipboard(fig_dist)).pack(side=tk.RIGHT, padx=5)
+    # 3. 툴바 프레임(dist_toolbar_frame)에 커스텀 버튼들 추가
+    ttk.Button(dist_toolbar_frame, text="Copy All", command=lambda: copy_figure_to_clipboard(fig_dist)).pack(side=tk.RIGHT, padx=5)
 
-dist_layout_var = tk.StringVar(value='2x2')
-ttk.Label(dist_toolbar_frame, text="Layout:").pack(side=tk.RIGHT, padx=(5,2))
-layout_combo = ttk.Combobox(dist_toolbar_frame, textvariable=dist_layout_var, values=['2x2', '1x4', '4x1'], state='readonly', width=6)
-layout_combo.pack(side=tk.RIGHT, padx=2)
-layout_combo.bind('<<ComboboxSelected>>', lambda e: change_dist_layout())
+    dist_layout_var = tk.StringVar(value='2x2')
+    ttk.Label(dist_toolbar_frame, text="Layout:").pack(side=tk.RIGHT, padx=(5,2))
+    layout_combo = ttk.Combobox(dist_toolbar_frame, textvariable=dist_layout_var, values=['2x2', '1x4', '4x1'], state='readonly', width=6)
+    layout_combo.pack(side=tk.RIGHT, padx=2)
+    layout_combo.bind('<<ComboboxSelected>>', lambda e: change_dist_layout())
 
-scan_filter_dist_var = tk.StringVar(value='All')
-ttk.Label(dist_toolbar_frame, text="Scan:").pack(side=tk.RIGHT, padx=(5,2))
-scan_combo_dist = ttk.Combobox(dist_toolbar_frame, textvariable=scan_filter_dist_var, values=['All', 'Reverse', 'Forward'], state='readonly', width=10)
-scan_combo_dist.pack(side=tk.RIGHT, padx=2)
-scan_combo_dist.bind('<<ComboboxSelected>>', lambda e: redraw_dist_plot())
+    scan_filter_dist_var = tk.StringVar(value='All')
+    ttk.Label(dist_toolbar_frame, text="Scan:").pack(side=tk.RIGHT, padx=(5,2))
+    scan_combo_dist = ttk.Combobox(dist_toolbar_frame, textvariable=scan_filter_dist_var, values=['All', 'Reverse', 'Forward'], state='readonly', width=10)
+    scan_combo_dist.pack(side=tk.RIGHT, padx=2)
+    scan_combo_dist.bind('<<ComboboxSelected>>', lambda e: redraw_dist_plot())
 
 
-# 4. (신규) 오른쪽 프레임(dist_controls_area_frame)에 모든 컨트롤을 배치
-dist_controls_area_frame.columnconfigure(0, weight=1)
-dist_controls_area_frame.columnconfigure(1, weight=4) # 훨씬 넓게 설정 (1:4 비율)
+    # 4. (신규) 오른쪽 프레임(dist_controls_area_frame)에 모든 컨트롤을 배치
+    dist_controls_area_frame.columnconfigure(0, weight=1)
+    dist_controls_area_frame.columnconfigure(1, weight=4) # 훨씬 넓게 설정 (1:4 비율)
 
-# 4-1. Plotted Distributions 리스트
-dist_list_frame = ttk.LabelFrame(dist_controls_area_frame, text="Plotted Distributions (Double-click to edit)")
-dist_list_frame.grid(row=0, column=0, sticky='nsew', padx=(0,5))
+    # 4-1. Plotted Distributions 리스트
+    dist_list_frame = ttk.LabelFrame(dist_controls_area_frame, text="Plotted Distributions (Double-click to edit)")
+    dist_list_frame.grid(row=0, column=0, sticky='nsew', padx=(0,5))
 
-dist_list_tree = ttk.Treeview(dist_list_frame, show='tree', height=5) # [수정] height 4 -> 5 (시인성 추가 확보)
-dist_list_tree.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
-dist_list_tree.column("#0", width=250, minwidth=150) # 너비 추가 확장
+    dist_list_tree = ttk.Treeview(dist_list_frame, show='tree', height=5) # [수정] height 4 -> 5 (시인성 추가 확보)
+    dist_list_tree.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+    dist_list_tree.column("#0", width=250, minwidth=150) # 너비 추가 확장
     
-dist_buttons_frame = ttk.Frame(dist_list_frame)
-dist_buttons_frame.pack(fill=tk.X, pady=2)
+    dist_buttons_frame = ttk.Frame(dist_list_frame)
+    dist_buttons_frame.pack(fill=tk.X, pady=2)
 
-# 버튼들을 2행으로 배치 (JV와 통일)
-dist_btn_row1 = ttk.Frame(dist_buttons_frame)
-dist_btn_row1.pack(fill=tk.X)
-ttk.Button(dist_btn_row1, text="Remove Selected", command=remove_selected_from_dist_graph).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
-ttk.Button(dist_btn_row1, text="Clear All", command=clear_dist_plot).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
+    # 버튼들을 2행으로 배치 (JV와 통일)
+    dist_btn_row1 = ttk.Frame(dist_buttons_frame)
+    dist_btn_row1.pack(fill=tk.X)
+    ttk.Button(dist_btn_row1, text="Remove Selected", command=remove_selected_from_dist_graph).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
+    ttk.Button(dist_btn_row1, text="Clear All", command=clear_dist_plot).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=1)
 
-dist_btn_row2 = ttk.Frame(dist_buttons_frame)
-dist_btn_row2.pack(fill=tk.X, pady=(1, 0))
-ttk.Button(dist_btn_row2, text="▲ Up", width=5, command=lambda: move_tree_item(dist_list_tree, -1, redraw_dist_plot)).pack(side=tk.LEFT, padx=1)
-ttk.Button(dist_btn_row2, text="▼ Down", width=5, command=lambda: move_tree_item(dist_list_tree, 1, redraw_dist_plot)).pack(side=tk.LEFT, padx=1)
+    dist_btn_row2 = ttk.Frame(dist_buttons_frame)
+    dist_btn_row2.pack(fill=tk.X, pady=(1, 0))
+    ttk.Button(dist_btn_row2, text="▲ Up", width=5, command=lambda: move_tree_item(dist_list_tree, -1, redraw_dist_plot)).pack(side=tk.LEFT, padx=1)
+    ttk.Button(dist_btn_row2, text="▼ Down", width=5, command=lambda: move_tree_item(dist_list_tree, 1, redraw_dist_plot)).pack(side=tk.LEFT, padx=1)
 
-# [수정] 설정 영역을 위한 내부 프레임 미리 생성
-dist_settings_inner_frame = ttk.Frame(dist_controls_area_frame)
-dist_settings_inner_frame.grid(row=0, column=1, sticky='nsew', padx=(5,0))
+    # [수정] 설정 영역을 위한 내부 프레임 미리 생성
+    dist_settings_inner_frame = ttk.Frame(dist_controls_area_frame)
+    dist_settings_inner_frame.grid(row=0, column=1, sticky='nsew', padx=(5,0))
 
-# 4-2. Y-Axis Range
-dist_axis_manage_frame = ttk.LabelFrame(dist_settings_inner_frame, text="Y-Axis Range")
-dist_axis_manage_frame.pack(side=tk.LEFT, fill=tk.Y, expand=True, pady=0, padx=5)
+    # 4-2. Y-Axis Range
+    dist_axis_manage_frame = ttk.LabelFrame(dist_settings_inner_frame, text="Y-Axis Range")
+    dist_axis_manage_frame.pack(side=tk.LEFT, fill=tk.Y, expand=True, pady=0, padx=5)
 
-dist_voc_min_var, dist_voc_max_var = tk.StringVar(), tk.StringVar()
-dist_jsc_min_var, dist_jsc_max_var = tk.StringVar(), tk.StringVar()
-dist_ff_min_var, dist_ff_max_var = tk.StringVar(), tk.StringVar()
-dist_pce_min_var, dist_pce_max_var = tk.StringVar(), tk.StringVar()
-params = ["Voc", "Jsc", "FF", "PCE"]
-vars_grid = [(dist_voc_min_var, dist_voc_max_var), (dist_jsc_min_var, dist_jsc_max_var),
-             (dist_ff_min_var, dist_ff_max_var), (dist_pce_min_var, dist_pce_max_var)]
-for i, param in enumerate(params):
-    ttk.Label(dist_axis_manage_frame, text=f"{param} min:").grid(row=i, column=0, sticky='e', padx=(5,0))
-    ttk.Entry(dist_axis_manage_frame, textvariable=vars_grid[i][0], width=7).grid(row=i, column=1)
-    ttk.Label(dist_axis_manage_frame, text="max:").grid(row=i, column=2, sticky='e')
-    ttk.Entry(dist_axis_manage_frame, textvariable=vars_grid[i][1], width=7).grid(row=i, column=3)
+    dist_voc_min_var, dist_voc_max_var = tk.StringVar(), tk.StringVar()
+    dist_jsc_min_var, dist_jsc_max_var = tk.StringVar(), tk.StringVar()
+    dist_ff_min_var, dist_ff_max_var = tk.StringVar(), tk.StringVar()
+    dist_pce_min_var, dist_pce_max_var = tk.StringVar(), tk.StringVar()
+    params = ["Voc", "Jsc", "FF", "PCE"]
+    vars_grid = [(dist_voc_min_var, dist_voc_max_var), (dist_jsc_min_var, dist_jsc_max_var),
+                 (dist_ff_min_var, dist_ff_max_var), (dist_pce_min_var, dist_pce_max_var)]
+    for i, param in enumerate(params):
+        ttk.Label(dist_axis_manage_frame, text=f"{param} min:").grid(row=i, column=0, sticky='e', padx=(5,0))
+        ttk.Entry(dist_axis_manage_frame, textvariable=vars_grid[i][0], width=7).grid(row=i, column=1)
+        ttk.Label(dist_axis_manage_frame, text="max:").grid(row=i, column=2, sticky='e')
+        ttk.Entry(dist_axis_manage_frame, textvariable=vars_grid[i][1], width=7).grid(row=i, column=3)
         
-dist_axis_buttons_frame = ttk.Frame(dist_axis_manage_frame)
-dist_axis_buttons_frame.grid(row=0, column=4, rowspan=4, padx=5, pady=4)
-ttk.Button(dist_axis_buttons_frame, text="Apply", command=update_dist_axis_limits).pack(expand=True, fill=tk.BOTH)
-ttk.Button(dist_axis_buttons_frame, text="Auto", command=auto_scale_dist_axes).pack(expand=True, fill=tk.BOTH)
+    dist_axis_buttons_frame = ttk.Frame(dist_axis_manage_frame)
+    dist_axis_buttons_frame.grid(row=0, column=4, rowspan=4, padx=5, pady=4)
+    ttk.Button(dist_axis_buttons_frame, text="Apply", command=update_dist_axis_limits).pack(expand=True, fill=tk.BOTH)
+    ttk.Button(dist_axis_buttons_frame, text="Auto", command=auto_scale_dist_axes).pack(expand=True, fill=tk.BOTH)
 
-# 4-3. Copy Subplots
-dist_export_frame = ttk.LabelFrame(dist_settings_inner_frame, text="Copy Subplots")
-dist_export_frame.pack(side=tk.LEFT, fill=tk.Y, expand=True, pady=0, padx=(5,0))
+    # 4-3. Copy Subplots
+    dist_export_frame = ttk.LabelFrame(dist_settings_inner_frame, text="Copy Subplots")
+    dist_export_frame.pack(side=tk.LEFT, fill=tk.Y, expand=True, pady=0, padx=(5,0))
 
-ttk.Button(dist_export_frame, text="Copy Voc...", command=lambda: copy_subplot_to_clipboard(0)).pack(padx=5, pady=2, fill=tk.X)
-ttk.Button(dist_export_frame, text="Copy Jsc...", command=lambda: copy_subplot_to_clipboard(1)).pack(padx=5, pady=2, fill=tk.X)
-ttk.Button(dist_export_frame, text="Copy FF...", command=lambda: copy_subplot_to_clipboard(2)).pack(padx=5, pady=2, fill=tk.X)
-ttk.Button(dist_export_frame, text="Copy PCE...", command=lambda: copy_subplot_to_clipboard(3)).pack(padx=5, pady=2, fill=tk.X)
+    ttk.Button(dist_export_frame, text="Copy Voc...", command=lambda: copy_subplot_to_clipboard(0)).pack(padx=5, pady=2, fill=tk.X)
+    ttk.Button(dist_export_frame, text="Copy Jsc...", command=lambda: copy_subplot_to_clipboard(1)).pack(padx=5, pady=2, fill=tk.X)
+    ttk.Button(dist_export_frame, text="Copy FF...", command=lambda: copy_subplot_to_clipboard(2)).pack(padx=5, pady=2, fill=tk.X)
+    ttk.Button(dist_export_frame, text="Copy PCE...", command=lambda: copy_subplot_to_clipboard(3)).pack(padx=5, pady=2, fill=tk.X)
 
-# --- Bottom Results Tabs ---
-bottom_paned_window = ttk.PanedWindow(bottom_frame, orient=tk.HORIZONTAL)
-bottom_paned_window.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    # --- Bottom Results Tabs ---
+    bottom_paned_window = ttk.PanedWindow(bottom_frame, orient=tk.HORIZONTAL)
+    bottom_paned_window.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-var_manage_frame = ttk.LabelFrame(bottom_paned_window, text="Experimental Variables")
-bottom_paned_window.add(var_manage_frame, weight=1) 
+    var_manage_frame = ttk.LabelFrame(bottom_paned_window, text="Experimental Variables")
+    bottom_paned_window.add(var_manage_frame, weight=1) 
 
-var_header_frame = ttk.Frame(var_manage_frame)
-var_header_frame.pack(fill='x', padx=10, pady=5)
-ttk.Label(var_header_frame, text="Current Sample:").pack(side=tk.LEFT)
-current_sample_label = tk.StringVar(value="[No sample selected]")
-ttk.Label(var_header_frame, textvariable=current_sample_label, font="-weight bold").pack(side=tk.LEFT, padx=5)
+    var_header_frame = ttk.Frame(var_manage_frame)
+    var_header_frame.pack(fill='x', padx=10, pady=5)
+    ttk.Label(var_header_frame, text="Current Sample:").pack(side=tk.LEFT)
+    current_sample_label = tk.StringVar(value="[No sample selected]")
+    ttk.Label(var_header_frame, textvariable=current_sample_label, font="-weight bold").pack(side=tk.LEFT, padx=5)
 
-var_grid_frame = ttk.Frame(var_manage_frame)
-var_grid_frame.pack(fill='x', padx=10, pady=5)
+    var_grid_frame = ttk.Frame(var_manage_frame)
+    var_grid_frame.pack(fill='x', padx=10, pady=5)
 
-var_entry_widgets.clear()
-var_checkbox_vars.clear()
+    var_entry_widgets.clear()
+    var_checkbox_vars.clear()
 
-for i, col in enumerate(variable_columns):
-    row, col_idx = i % 5, (i // 5) * 3
+    for i, col in enumerate(variable_columns):
+        row, col_idx = i % 5, (i // 5) * 3
 
-    chk_var = tk.BooleanVar()
-    chk = ttk.Checkbutton(var_grid_frame, text=f"{col}:", variable=chk_var)
-    chk.grid(row=row, column=col_idx, sticky='w', padx=5, pady=2)
+        chk_var = tk.BooleanVar()
+        chk = ttk.Checkbutton(var_grid_frame, text=f"{col}:", variable=chk_var)
+        chk.grid(row=row, column=col_idx, sticky='w', padx=5, pady=2)
 
-    var = tk.StringVar()
-    entry = ttk.Entry(var_grid_frame, textvariable=var, width=15)
-    entry.grid(row=row, column=col_idx + 1, sticky='w', padx=5, pady=2)
+        var = tk.StringVar()
+        entry = ttk.Entry(var_grid_frame, textvariable=var, width=15)
+        entry.grid(row=row, column=col_idx + 1, sticky='w', padx=5, pady=2)
 
-    var_entry_widgets[col] = (var, entry)
-    var_checkbox_vars[col] = chk_var
+        var_entry_widgets[col] = (var, entry)
+        var_checkbox_vars[col] = chk_var
 
-    if col == "Perovskite":
-        # [신규] "Build..."와 "..." 버튼 2개를 나란히 담을 프레임 생성
-        button_frame = ttk.Frame(var_grid_frame)
+        if col == "Perovskite":
+            # [신규] "Build..."와 "..." 버튼 2개를 나란히 담을 프레임 생성
+            button_frame = ttk.Frame(var_grid_frame)
         
-        # [수정] 프레임을 기존 버튼 위치(col_idx + 2)에 배치합니다.
-        # padx=0으로 설정하고, 개별 버튼에 padx를 줍니다.
-        button_frame.grid(row=row, column=col_idx + 2, sticky='w', padx=0)
+            # [수정] 프레임을 기존 버튼 위치(col_idx + 2)에 배치합니다.
+            # padx=0으로 설정하고, 개별 버튼에 padx를 줍니다.
+            button_frame.grid(row=row, column=col_idx + 2, sticky='w', padx=0)
 
-        # [수정] "Build..." 버튼의 부모를 'var_grid_frame' -> 'button_frame'으로 변경
-        # .grid() 대신 .pack(side=tk.LEFT) 사용
-        ttk.Button(
-            button_frame, 
-            text="Build...", 
-            command=lambda s=current_sample_label: PerovskiteBuilderWindow(root, s.get()), 
-            width=5
-        ).pack(side=tk.LEFT, padx=(2, 2)) # 왼쪽에 배치
+            # [수정] "Build..." 버튼의 부모를 'var_grid_frame' -> 'button_frame'으로 변경
+            # .grid() 대신 .pack(side=tk.LEFT) 사용
+            ttk.Button(
+                button_frame, 
+                text="Build...", 
+                command=lambda s=current_sample_label: PerovskiteBuilderWindow(root, s.get()), 
+                width=5
+            ).pack(side=tk.LEFT, padx=(2, 2)) # 왼쪽에 배치
         
-        entry.config(state='readonly')
+            entry.config(state='readonly')
 
-        # [신규] "..." (상세정보) 버튼을 'button_frame'에 추가
-        btn = ttk.Button(
-            button_frame, # 부모를 'button_frame'으로
-            text="...",
-            width=3,
-            command=lambda c=col, v=var: open_variable_selector(c, v)
-        )
-        btn.pack(side=tk.LEFT, padx=(0, 2)) # "Build..." 버튼 오른쪽에 배치
+            # [신규] "..." (상세정보) 버튼을 'button_frame'에 추가
+            btn = ttk.Button(
+                button_frame, # 부모를 'button_frame'으로
+                text="...",
+                width=3,
+                command=lambda c=col, v=var: open_variable_selector(c, v)
+            )
+            btn.pack(side=tk.LEFT, padx=(0, 2)) # "Build..." 버튼 오른쪽에 배치
 
-    elif col in VARIABLE_PRESETS:
-        btn = ttk.Button(
-            var_grid_frame,
-            text="...",
-            width=3,
-            command=lambda c=col, v=var: open_variable_selector(c, v)
-        )
-        btn.grid(row=row, column=col_idx + 2, sticky='w', padx=2)
-        entry.config(state='readonly')
+        elif col in VARIABLE_PRESETS:
+            btn = ttk.Button(
+                var_grid_frame,
+                text="...",
+                width=3,
+                command=lambda c=col, v=var: open_variable_selector(c, v)
+            )
+            btn.grid(row=row, column=col_idx + 2, sticky='w', padx=2)
+            entry.config(state='readonly')
 
-# "Contact" 항목 (i=6)의 위치 계산:
-# row = 6 % 5 = 1
-# col_idx = (6 // 5) * 3 = 3
-# Contact의 Entry 위젯은 column = col_idx + 1 = 4 에 있습니다.
-# 따라서 버튼은 row=2, column=4 부터 시작합니다.
+    # "Contact" 항목 (i=6)의 위치 계산:
+    # row = 6 % 5 = 1
+    # col_idx = (6 // 5) * 3 = 3
+    # Contact의 Entry 위젯은 column = col_idx + 1 = 4 에 있습니다.
+    # 따라서 버튼은 row=2, column=4 부터 시작합니다.
 
-save_vars_button = ttk.Button(
-    var_grid_frame,  # 1. 부모를 var_grid_frame으로 변경
-    text="Save Variables for Selected Sample", 
-    command=lambda: save_variables_for_selected_sample()
-)
-# 2. .pack() 대신 .grid() 사용
-save_vars_button.grid(
-    row=2,           # Contact의 다음 행(row)
-    column=4,        # Contact의 Entry와 같은 열(column)
-    columnspan=2,    # Entry와 "..." 버튼의 너비를 합친 만큼(2칸) 차지
-    sticky='ew',     # 좌우로 꽉 채우기
-    padx=5, 
-    pady=(10, 2)     # 위쪽 여백 10, 아래쪽 2
-)
+    save_vars_button = ttk.Button(
+        var_grid_frame,  # 1. 부모를 var_grid_frame으로 변경
+        text="Save Variables for Selected Sample", 
+        command=lambda: save_variables_for_selected_sample()
+    )
+    # 2. .pack() 대신 .grid() 사용
+    save_vars_button.grid(
+        row=2,           # Contact의 다음 행(row)
+        column=4,        # Contact의 Entry와 같은 열(column)
+        columnspan=2,    # Entry와 "..." 버튼의 너비를 합친 만큼(2칸) 차지
+        sticky='ew',     # 좌우로 꽉 채우기
+        padx=5, 
+        pady=(10, 2)     # 위쪽 여백 10, 아래쪽 2
+    )
 
-view_details_button = ttk.Button(
-    var_grid_frame,  # 1. 부모를 var_grid_frame으로 변경
-    text="View Process Details",
-    command=view_process_details
-)
-# 2. .pack() 대신 .grid() 사용
-view_details_button.grid(
-    row=3,           # "Save" 버튼의 다음 행(row)
-    column=4,        # "Save" 버튼과 같은 열(column)
-    columnspan=2,    # 2칸 차지
-    sticky='ew',     # 좌우로 꽉 채우기
-    padx=5, 
-    pady=2
-)
+    view_details_button = ttk.Button(
+        var_grid_frame,  # 1. 부모를 var_grid_frame으로 변경
+        text="View Process Details",
+        command=view_process_details
+    )
+    # 2. .pack() 대신 .grid() 사용
+    view_details_button.grid(
+        row=3,           # "Save" 버튼의 다음 행(row)
+        column=4,        # "Save" 버튼과 같은 열(column)
+        columnspan=2,    # 2칸 차지
+        sticky='ew',     # 좌우로 꽉 채우기
+        padx=5, 
+        pady=2
+    )
 
-notebook = ttk.Notebook(bottom_paned_window)
-bottom_paned_window.add(notebook, weight=2) 
+    notebook = ttk.Notebook(bottom_paned_window)
+    bottom_paned_window.add(notebook, weight=2) 
 
-tab1 = ttk.Frame(notebook); tab2 = ttk.Frame(notebook); tab3 = ttk.Frame(notebook)
-notebook.add(tab1, text="All Devices"); notebook.add(tab2, text="Best Device by Sample"); notebook.add(tab3, text="Statistics by Sample")
+    tab1 = ttk.Frame(notebook); tab2 = ttk.Frame(notebook); tab3 = ttk.Frame(notebook)
+    notebook.add(tab1, text="All Devices"); notebook.add(tab2, text="Best Device by Sample"); notebook.add(tab3, text="Statistics by Sample")
 
-# --- Tab 1: All Devices Table ---
-all_devices_frame = ttk.Frame(tab1)
-all_devices_frame.pack(fill=tk.BOTH, expand=True)
-copy_btn1 = ttk.Button(all_devices_frame, text="Copy Table", command=lambda: copy_treeview_to_clipboard(pce_table_all))
-copy_btn1.pack(anchor='ne', padx=5, pady=2)
-pce_table_all_frame = ttk.Frame(all_devices_frame)
-pce_table_all_frame.pack(fill=tk.BOTH, expand=True)
-pce_table_all = ttk.Treeview(pce_table_all_frame, columns=('File', 'Scan', 'Voc (V)', 'Jsc (mA/cm2)', 'FF (%)', 'PCE (%)', 'Rs (Ω·cm²)','Rsh (Ω·cm²)'))
-pce_table_all.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-v_scroll1 = ttk.Scrollbar(pce_table_all_frame, orient=tk.VERTICAL, command=pce_table_all.yview)
-h_scroll1 = ttk.Scrollbar(all_devices_frame, orient=tk.HORIZONTAL, command=pce_table_all.xview)
-pce_table_all.configure(yscrollcommand=v_scroll1.set, xscrollcommand=h_scroll1.set)
-v_scroll1.pack(side=tk.RIGHT, fill=tk.Y); h_scroll1.pack(side=tk.BOTTOM, fill=tk.X)
-pce_table_all.column('#0', width=0, stretch=tk.NO); pce_table_all.heading('#0', text='', anchor='w')
-for col in pce_table_all['columns']:
-    pce_table_all.heading(col, text=col, anchor='center'); pce_table_all.column(col, anchor='center', width=100)
-pce_table_all.column('File', width=300, anchor='w')
-pce_table_all.column('Scan', width=80)
+    # --- Tab 1: All Devices Table ---
+    all_devices_frame = ttk.Frame(tab1)
+    all_devices_frame.pack(fill=tk.BOTH, expand=True)
+    copy_btn1 = ttk.Button(all_devices_frame, text="Copy Table", command=lambda: copy_treeview_to_clipboard(pce_table_all))
+    copy_btn1.pack(anchor='ne', padx=5, pady=2)
+    pce_table_all_frame = ttk.Frame(all_devices_frame)
+    pce_table_all_frame.pack(fill=tk.BOTH, expand=True)
+    pce_table_all = ttk.Treeview(pce_table_all_frame, columns=('File', 'Scan', 'Voc (V)', 'Jsc (mA/cm2)', 'FF (%)', 'PCE (%)', 'Rs (Ω·cm²)','Rsh (Ω·cm²)'))
+    pce_table_all.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    v_scroll1 = ttk.Scrollbar(pce_table_all_frame, orient=tk.VERTICAL, command=pce_table_all.yview)
+    h_scroll1 = ttk.Scrollbar(all_devices_frame, orient=tk.HORIZONTAL, command=pce_table_all.xview)
+    pce_table_all.configure(yscrollcommand=v_scroll1.set, xscrollcommand=h_scroll1.set)
+    v_scroll1.pack(side=tk.RIGHT, fill=tk.Y); h_scroll1.pack(side=tk.BOTTOM, fill=tk.X)
+    pce_table_all.column('#0', width=0, stretch=tk.NO); pce_table_all.heading('#0', text='', anchor='w')
+    for col in pce_table_all['columns']:
+        pce_table_all.heading(col, text=col, anchor='center'); pce_table_all.column(col, anchor='center', width=100)
+    pce_table_all.column('File', width=300, anchor='w')
+    pce_table_all.column('Scan', width=80)
 
-# --- Tab 2: Best Devices Table ---
-best_devices_frame = ttk.Frame(tab2)
-best_devices_frame.pack(fill=tk.BOTH, expand=True)
-copy_btn2 = ttk.Button(best_devices_frame, text="Copy Table", command=lambda: copy_treeview_to_clipboard(pce_table_best))
-copy_btn2.pack(anchor='ne', padx=5, pady=2)
-pce_table_best_frame = ttk.Frame(best_devices_frame)
-pce_table_best_frame.pack(fill=tk.BOTH, expand=True)
-pce_table_best = ttk.Treeview(pce_table_best_frame, columns=('Sample', 'File', 'Scan', 'Voc (V)', 'Jsc (mA/cm2)', 'FF (%)', 'PCE (%)', 'Rs (Ω·cm²)', 'Rsh (Ω·cm²)'))
-pce_table_best.pack(fill=tk.BOTH, expand=True)
-for col in pce_table_best['columns']:
-    pce_table_best.heading(col, text=col, anchor='center'); pce_table_best.column(col, anchor='center', width=120)
-pce_table_best.column('#0', width=0, stretch=tk.NO)
-pce_table_best.column('Scan', width=80)
+    # --- Tab 2: Best Devices Table ---
+    best_devices_frame = ttk.Frame(tab2)
+    best_devices_frame.pack(fill=tk.BOTH, expand=True)
+    copy_btn2 = ttk.Button(best_devices_frame, text="Copy Table", command=lambda: copy_treeview_to_clipboard(pce_table_best))
+    copy_btn2.pack(anchor='ne', padx=5, pady=2)
+    pce_table_best_frame = ttk.Frame(best_devices_frame)
+    pce_table_best_frame.pack(fill=tk.BOTH, expand=True)
+    pce_table_best = ttk.Treeview(pce_table_best_frame, columns=('Sample', 'File', 'Scan', 'Voc (V)', 'Jsc (mA/cm2)', 'FF (%)', 'PCE (%)', 'Rs (Ω·cm²)', 'Rsh (Ω·cm²)'))
+    pce_table_best.pack(fill=tk.BOTH, expand=True)
+    for col in pce_table_best['columns']:
+        pce_table_best.heading(col, text=col, anchor='center'); pce_table_best.column(col, anchor='center', width=120)
+    pce_table_best.column('#0', width=0, stretch=tk.NO)
+    pce_table_best.column('Scan', width=80)
 
-# --- Tab 3: Statistics Table ---
-stats_frame = ttk.Frame(tab3)
-stats_frame.pack(fill=tk.BOTH, expand=True)
-copy_btn3 = ttk.Button(stats_frame, text="Copy Table", command=lambda: copy_treeview_to_clipboard(pce_table_stats))
-copy_btn3.pack(anchor='ne', padx=5, pady=2)
-pce_table_stats_frame = ttk.Frame(stats_frame)
-pce_table_stats_frame.pack(fill=tk.BOTH, expand=True)
-pce_table_stats = ttk.Treeview(stats_frame, columns=('Sample', 'Count', 'Voc (V)', 'Jsc (mA/cm2)', 'FF (%)', 'PCE (%)', 'Rs (Ω·cm²)', 'Rsh (Ω·cm²)'))
-pce_table_stats.pack(fill=tk.BOTH, expand=True)
-for col in pce_table_stats['columns']:
-    pce_table_stats.heading(col, text=col, anchor='center'); pce_table_stats.column(col, anchor='center', width=150)
-pce_table_stats.column('#0', width=0, stretch=tk.NO)
+    # --- Tab 3: Statistics Table ---
+    stats_frame = ttk.Frame(tab3)
+    stats_frame.pack(fill=tk.BOTH, expand=True)
+    copy_btn3 = ttk.Button(stats_frame, text="Copy Table", command=lambda: copy_treeview_to_clipboard(pce_table_stats))
+    copy_btn3.pack(anchor='ne', padx=5, pady=2)
+    pce_table_stats_frame = ttk.Frame(stats_frame)
+    pce_table_stats_frame.pack(fill=tk.BOTH, expand=True)
+    pce_table_stats = ttk.Treeview(stats_frame, columns=('Sample', 'Count', 'Voc (V)', 'Jsc (mA/cm2)', 'FF (%)', 'PCE (%)', 'Rs (Ω·cm²)', 'Rsh (Ω·cm²)'))
+    pce_table_stats.pack(fill=tk.BOTH, expand=True)
+    for col in pce_table_stats['columns']:
+        pce_table_stats.heading(col, text=col, anchor='center'); pce_table_stats.column(col, anchor='center', width=150)
+    pce_table_stats.column('#0', width=0, stretch=tk.NO)
 
-# --- Signature / Copyright Label ---
-signature_frame = ttk.Frame(bottom_frame)
-signature_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 5))
-signature_text = "Solar Cell Analysis Tool | Developed by Hyoungwoo Kwon (Ver 2.9 PPTX Export)"
-ttk.Label(signature_frame, text=signature_text, font=('Helvetica', 9), anchor='e').pack(fill=tk.X)
+    # --- Signature / Copyright Label ---
+    signature_frame = ttk.Frame(bottom_frame)
+    signature_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=(0, 5))
+    signature_text = "Solar Cell Analysis Tool | Developed by Hyoungwoo Kwon (Ver 2.9 PPTX Export)"
+    ttk.Label(signature_frame, text=signature_text, font=('Helvetica', 9), anchor='e').pack(fill=tk.X)
 
-# --- Functions to connect UI elements ---
-def on_file_tree_select(event):
-    """파일 트리에서 샘플 폴더를 선택하면 변수 관리자 UI를 업데이트합니다."""
-    selected_items = file_tree.selection()
-    if not selected_items:
-        current_sample_label.set("[No sample selected]")
+    # --- Functions to connect UI elements ---
+    def on_file_tree_select(event):
+        """파일 트리에서 샘플 폴더를 선택하면 변수 관리자 UI를 업데이트합니다."""
+        selected_items = file_tree.selection()
+        if not selected_items:
+            current_sample_label.set("[No sample selected]")
+            for col in variable_columns:
+                var_entry_widgets[col][0].set("")
+                # 'readonly' 상태인 엔트리도 비활성화합니다.
+                var_entry_widgets[col][1].config(state='disabled')
+
+                if col in var_checkbox_vars:
+                    var_checkbox_vars[col].set(False)
+            save_vars_button.config(state='disabled')
+            return
+
+        selected_item_id = selected_items[0]
+    
+        # [신규] 개별 파일이 선택된 경우 All Devices 테이블에서 해당 행으로 스크롤
+        if file_tree.parent(selected_item_id):
+            # 자식 항목(파일)이 선택됨
+            file_path = file_tree.item(selected_item_id, 'values')[0]
+        
+            # All Devices 테이블에서 해당 파일 찾기
+            for item in pce_table_all.get_children():
+                values = pce_table_all.item(item, 'values')
+                if values and len(values) > 0:
+                    # 첫 번째 컬럼은 "Sample/File" 형식
+                    table_file_path = values[0]
+                    # FullPath와 비교하기 위해 파일명 추출
+                    if file_path in current_display_df['FullPath'].values:
+                        row_data = current_display_df[current_display_df['FullPath'] == file_path].iloc[0]
+                        expected_name = f"{row_data['Sample']}/{row_data['File']}"
+                        if table_file_path == expected_name:
+                            # 해당 행으로 스크롤하고 선택
+                            pce_table_all.selection_set(item)
+                            pce_table_all.see(item)
+                            # Best Device 탭으로 전환하지 않고 All Devices 탭 유지
+                            notebook.select(tab1)
+                            break
+        
+            # 부모 폴더로 변경하여 변수 관리자 업데이트
+            selected_item_id = file_tree.parent(selected_item_id)
+
+        sample_name = file_tree.item(selected_item_id, 'text')
+        current_sample_label.set(sample_name)
+
+        sample_vars = experimental_variables.get(sample_name, {})
         for col in variable_columns:
-            var_entry_widgets[col][0].set("")
-            # 'readonly' 상태인 엔트리도 비활성화합니다.
-            var_entry_widgets[col][1].config(state='disabled')
+            var_entry_widgets[col][0].set(sample_vars.get(col, ""))
+
+            # 'readonly'가 아닌 일반 엔트리만 'normal'로 설정합니다.
+            if col not in VARIABLE_PRESETS and col != "Perovskite":
+                var_entry_widgets[col][1].config(state='normal')
+            else:
+                # 'readonly' 항목은 다시 활성화합니다.
+                var_entry_widgets[col][1].config(state='readonly')
 
             if col in var_checkbox_vars:
-                var_checkbox_vars[col].set(False)
-        save_vars_button.config(state='disabled')
-        return
+                var_checkbox_vars[col].set(sample_vars.get(f"{col}_is_var", False))
 
-    selected_item_id = selected_items[0]
-    
-    # [신규] 개별 파일이 선택된 경우 All Devices 테이블에서 해당 행으로 스크롤
-    if file_tree.parent(selected_item_id):
-        # 자식 항목(파일)이 선택됨
-        file_path = file_tree.item(selected_item_id, 'values')[0]
-        
-        # All Devices 테이블에서 해당 파일 찾기
-        for item in pce_table_all.get_children():
-            values = pce_table_all.item(item, 'values')
-            if values and len(values) > 0:
-                # 첫 번째 컬럼은 "Sample/File" 형식
-                table_file_path = values[0]
-                # FullPath와 비교하기 위해 파일명 추출
-                if file_path in current_display_df['FullPath'].values:
-                    row_data = current_display_df[current_display_df['FullPath'] == file_path].iloc[0]
-                    expected_name = f"{row_data['Sample']}/{row_data['File']}"
-                    if table_file_path == expected_name:
-                        # 해당 행으로 스크롤하고 선택
-                        pce_table_all.selection_set(item)
-                        pce_table_all.see(item)
-                        # Best Device 탭으로 전환하지 않고 All Devices 탭 유지
-                        notebook.select(tab1)
-                        break
-        
-        # 부모 폴더로 변경하여 변수 관리자 업데이트
-        selected_item_id = file_tree.parent(selected_item_id)
+        save_vars_button.config(state='normal')
 
-    sample_name = file_tree.item(selected_item_id, 'text')
-    current_sample_label.set(sample_name)
+    def save_variables_for_selected_sample():
+        """변수 관리자 패널의 현재 값을 선택된 샘플에 저장합니다."""
+        global current_display_df, experimental_variables, process_details # <-- 1. process_details를 global로 가져옵니다.
+        sample_name = current_sample_label.get()
+        if sample_name == "[No sample selected]":
+            messagebox.showwarning("No Sample", "Please select a sample folder from the list first.")
+            return
 
-    sample_vars = experimental_variables.get(sample_name, {})
-    for col in variable_columns:
-        var_entry_widgets[col][0].set(sample_vars.get(col, ""))
+        if sample_name not in experimental_variables:
+            experimental_variables[sample_name] = {}
 
-        # 'readonly'가 아닌 일반 엔트리만 'normal'로 설정합니다.
-        if col not in VARIABLE_PRESETS and col != "Perovskite":
-            var_entry_widgets[col][1].config(state='normal')
-        else:
-            # 'readonly' 항목은 다시 활성화합니다.
-            var_entry_widgets[col][1].config(state='readonly')
+        control_vars_to_fill = {}
+        for col in variable_columns:
+            value = var_entry_widgets[col][0].get()
+            is_variable = var_checkbox_vars[col].get() if col in var_checkbox_vars else False
 
-        if col in var_checkbox_vars:
-            var_checkbox_vars[col].set(sample_vars.get(f"{col}_is_var", False))
+            experimental_variables[sample_name][col] = value
+            experimental_variables[sample_name][f"{col}_is_var"] = is_variable
 
-    save_vars_button.config(state='normal')
+            if not is_variable and value:
+                control_vars_to_fill[col] = value
 
-def save_variables_for_selected_sample():
-    """변수 관리자 패널의 현재 값을 선택된 샘플에 저장합니다."""
-    global current_display_df, experimental_variables, process_details # <-- 1. process_details를 global로 가져옵니다.
-    sample_name = current_sample_label.get()
-    if sample_name == "[No sample selected]":
-        messagebox.showwarning("No Sample", "Please select a sample folder from the list first.")
-        return
-
-    if sample_name not in experimental_variables:
-        experimental_variables[sample_name] = {}
-
-    control_vars_to_fill = {}
-    for col in variable_columns:
-        value = var_entry_widgets[col][0].get()
-        is_variable = var_checkbox_vars[col].get() if col in var_checkbox_vars else False
-
-        experimental_variables[sample_name][col] = value
-        experimental_variables[sample_name][f"{col}_is_var"] = is_variable
-
-        if not is_variable and value:
-            control_vars_to_fill[col] = value
-
-    if control_vars_to_fill:
-        msg = "The following control variables (unchecked) will be applied to ALL other samples:\n\n"
-        msg += "\n".join([f"{col}: {val}" for col, val in control_vars_to_fill.items()])
-        msg += "\n\nProceed?"
-        if messagebox.askyesno("Apply Control Variables?", msg, parent=root):
-            all_samples = current_display_df['Sample'].unique()
-            for s in all_samples:
-                if s == sample_name: 
-                    continue
-                if s not in experimental_variables:
-                    experimental_variables[s] = {}
+        if control_vars_to_fill:
+            msg = "The following control variables (unchecked) will be applied to ALL other samples:\n\n"
+            msg += "\n".join([f"{col}: {val}" for col, val in control_vars_to_fill.items()])
+            msg += "\n\nProceed?"
+            if messagebox.askyesno("Apply Control Variables?", msg, parent=root):
+                all_samples = current_display_df['Sample'].unique()
+                for s in all_samples:
+                    if s == sample_name: 
+                        continue
+                    if s not in experimental_variables:
+                        experimental_variables[s] = {}
                 
-                for col, val in control_vars_to_fill.items():
-                    is_var_key = f"{col}_is_var"
-                    if is_var_key not in experimental_variables[s]:
-                        experimental_variables[s][is_var_key] = False
+                    for col, val in control_vars_to_fill.items():
+                        is_var_key = f"{col}_is_var"
+                        if is_var_key not in experimental_variables[s]:
+                            experimental_variables[s][is_var_key] = False
                     
-                    # 1. 'experimental_variables'의 값을 복사합니다. (기존 로직)
-                    experimental_variables[s][col] = val
+                        # 1. 'experimental_variables'의 값을 복사합니다. (기존 로직)
+                        experimental_variables[s][col] = val
 
-                    # --- NEW: 'process_details'도 함께 복사합니다. (추가된 로직) ---
-                    # 'val' (예: "NiOx + PEDOT")을 개별 재료로 분리합니다.
-                    materials_to_copy = [m.strip() for m in val.split(' + ') if m.strip()]
+                        # --- NEW: 'process_details'도 함께 복사합니다. (추가된 로직) ---
+                        # 'val' (예: "NiOx + PEDOT")을 개별 재료로 분리합니다.
+                        materials_to_copy = [m.strip() for m in val.split(' + ') if m.strip()]
                     
-                    for material in materials_to_copy:
-                        # 원본 샘플(현재 선택된 샘플)에서 공정 상세정보를 가져옵니다.
-                        source_details = process_details.get(sample_name, {}).get(col, {}).get(material, {})
+                        for material in materials_to_copy:
+                            # 원본 샘플(현재 선택된 샘플)에서 공정 상세정보를 가져옵니다.
+                            source_details = process_details.get(sample_name, {}).get(col, {}).get(material, {})
                         
-                        if source_details: # 복사할 상세정보가 있다면
-                            # 대상 샘플(s)의 딕셔너리 구조를 생성합니다.
-                            if s not in process_details:
-                                process_details[s] = {}
-                            if col not in process_details[s]:
-                                process_details[s][col] = {}
+                            if source_details: # 복사할 상세정보가 있다면
+                                # 대상 샘플(s)의 딕셔너리 구조를 생성합니다.
+                                if s not in process_details:
+                                    process_details[s] = {}
+                                if col not in process_details[s]:
+                                    process_details[s][col] = {}
                                 
-                            # 대상 샘플(s)에 상세정보를 복사합니다.
-                            process_details[s][col][material] = source_details.copy()
-                    # --- END NEW ---
+                                # 대상 샘플(s)에 상세정보를 복사합니다.
+                                process_details[s][col][material] = source_details.copy()
+                        # --- END NEW ---
 
-    merged_vars_df = pd.DataFrame.from_dict(
-        experimental_variables, 
-        orient='index'
-    ).reset_index().rename(columns={'index': 'Sample'})
+        merged_vars_df = pd.DataFrame.from_dict(
+            experimental_variables, 
+            orient='index'
+        ).reset_index().rename(columns={'index': 'Sample'})
 
-    all_var_cols_to_consider = variable_columns + [f"{col}_is_var" for col in variable_columns]
-    cols_to_drop = [
-        col for col in all_var_cols_to_consider 
-        if col in current_display_df.columns and col != 'Sample'
-    ]
+        all_var_cols_to_consider = variable_columns + [f"{col}_is_var" for col in variable_columns]
+        cols_to_drop = [
+            col for col in all_var_cols_to_consider 
+            if col in current_display_df.columns and col != 'Sample'
+        ]
 
-    df_without_vars = current_display_df.drop(columns=cols_to_drop, errors='ignore')
-    current_display_df = pd.merge(df_without_vars, merged_vars_df, on="Sample", how="left")
+        df_without_vars = current_display_df.drop(columns=cols_to_drop, errors='ignore')
+        current_display_df = pd.merge(df_without_vars, merged_vars_df, on="Sample", how="left")
 
-    refresh_all_views(current_display_df)
-    messagebox.showinfo("Variables Saved", f"Experimental variables for '{sample_name}' have been saved.")
+        refresh_all_views(current_display_df)
+        messagebox.showinfo("Variables Saved", f"Experimental variables for '{sample_name}' have been saved.")
 
-# Bind the function to the file tree selection
-file_tree.bind('<<TreeviewSelect>>', on_file_tree_select)
+    # Bind the function to the file tree selection
+    file_tree.bind('<<TreeviewSelect>>', on_file_tree_select)
 
-# --- [추가] 마우스 오른쪽 클릭 이벤트를 바인딩합니다. ---
-file_tree.bind("<Button-3>", on_file_tree_right_click)
-# --- [추가 끝] ---
-
-
-# Initially disable variable entries
-for col in variable_columns:
-    var_entry_widgets[col][1].config(state='disabled')
-save_vars_button.config(state='disabled')
+    # --- [추가] 마우스 오른쪽 클릭 이벤트를 바인딩합니다. ---
+    file_tree.bind("<Button-3>", on_file_tree_right_click)
+    # --- [추가 끝] ---
 
 
-# --- Initial Draw ---
-redraw_jv_graphs()
-redraw_dist_plot()
+    # Initially disable variable entries
+    for col in variable_columns:
+        var_entry_widgets[col][1].config(state='disabled')
+    save_vars_button.config(state='disabled')
 
-# [신규] GUI가 완전히 준비되면 로딩창을 닫습니다.
-if pyi_splash:
-    root.after(200, pyi_splash.close)
 
-root.mainloop()
+    # --- Initial Draw ---
+    redraw_jv_graphs()
+    redraw_dist_plot()
+
+    # [신규] GUI가 완전히 준비되면 로딩창을 닫습니다.
+    if pyi_splash:
+        root.after(200, pyi_splash.close)
+
+    root.mainloop()
 
