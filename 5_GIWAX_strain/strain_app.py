@@ -95,6 +95,9 @@ if uploaded_files:
                     mask = (q >= q_min) & (q <= q_max)
                     q_cut, I_cut = q[mask], I[mask]
                     
+                    if len(q_cut) == 0:
+                        raise ValueError(f"설정하신 Fitting 범위(q={q_min}~{q_max}) 내에 데이터가 하나도 없습니다! (현재 계산된 전체 이미지의 최대 q값은 {q.max():.4f} 입니다). SDD나 Pixel Size 등 Setup 수치를 다시 확인해 주세요.")
+                    
                     model = GaussianModel()
                     params = model.guess(I_cut, x=q_cut)
                     out = model.fit(I_cut, params, x=q_cut)
