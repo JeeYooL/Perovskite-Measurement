@@ -18,32 +18,20 @@ def extract_incidence_angle(filename):
 st.set_page_config(page_title="UNIST 6D Strain Analyzer", layout="wide")
 st.title("🔬 6D 빔라인 Strain 분석 (Igor 매뉴얼 셋업 적용)")
 
-# --- 사이드바: Igor 매뉴얼 기반 설정 [cite: 498, 538] ---
-st.sidebar.header("⚙️ Experimental Setup (Igor/MATLAB)")
+# --- 사이드바: 빔 정보 설정 ---
+st.sidebar.header("1. 빔라인 세팅 (6D UNIST-PAL)")
+energy_kev = st.sidebar.number_input("Energy (keV)", value=12.4, help="보통 5~20 keV 사이를 사용합니다.")
+dist_mm = st.sidebar.number_input("Sample-to-Detector Distance (mm)", value=200.0)
+pixel_size_um = st.sidebar.number_input("Pixel Size (um)", value=172.0, help="검출기 픽셀 크기 (예: Pilatus=172, Rayonix=73.2)")
+center_x = st.sidebar.number_input("Beam Center X (pixel)", value=1024)
+center_y = st.sidebar.number_input("Beam Center Y (pixel)", value=512)
 
-# 매뉴얼 3p의 용어와 동일하게 구성 
-energy_kev = st.sidebar.number_input("X-ray Energy (keV)", value=11.564, format="%.3f")
-pixel_size_mm = st.sidebar.number_input("Pixel size (mm)", value=0.078125, format="%.6f")
-
-col_c1, col_c2 = st.sidebar.columns(2)
-with col_c1:
-    center_x = st.sidebar.number_input("Center X (MATLAB)", value=1441.36)
-with col_c2:
-    center_y = st.sidebar.number_input("Center Y (MATLAB)", value=1054.49)
-
-# Igor 매뉴얼 핵심: DBx = CenterX - 1 
-dbx = center_x - 1
-dby = center_y - 1
-
-sdd_mm = st.sidebar.number_input("SDD (mm)", value=3057.064, format="%.3f")
-
-# 물리량 변환 (pyFAI용)
-wavelength = (12.3984 / energy_kev) * 1e-10 
-dist_m = sdd_mm / 1000.0
-pixel_m = pixel_size_mm / 1000.0
-# pyFAI는 (y, x) 순서이며 0-based 이므로 DB값을 그대로 미터로 환산 
-poni1 = dby * pixel_m 
-poni2 = dbx * pixel_m
+# 물리량 계산
+wavelength = (12.3984 / energy_kev) * 1e-10 # 파장 (m)
+dist_m = dist_mm / 1000.0
+pixel_m = pixel_size_um * 1e-6
+poni1 = center_y * pixel_m # pyFAI 표준 좌표계
+poni2 = center_x * pixel_m
 
 st.sidebar.divider()
 st.sidebar.header("🎯 Analysis Parameters")
