@@ -149,4 +149,4 @@ if uploaded_files:
                 ax_res.grid(True, alpha=0.3)
                 st.pyplot(fig_res)
                 
-                st.download_button("💾 결과 CSV 저장", res_df.to_csv(index=False).encode('utf-8-sig'), "strain_results.csv")
+                st.download_button("💾 결과 CSV 저장", res_df.to_csv(index=False).encode('utf-8-sig'), "strain_results.csv", key="download_csv_results")
